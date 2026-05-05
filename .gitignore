@@ -3,6 +3,7 @@ dist
 .env
 .env.local
 allow.json
+runtime.json
 *.log
 
 # Root .gitignore has `.env*` which would otherwise hide our committed example.
