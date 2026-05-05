@@ -13,10 +13,22 @@
  * already serve via kind 31313 / 31314.
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve, dirname, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createLogger } from './log.js';
 import type { Config } from './config.js';
 import type { RoomManager } from './room-manager.js';
+import {
+  AuthError,
+  applyOverrides,
+  effectiveOperator,
+  loadRuntimeOverrides,
+  saveRuntimeOverrides,
+  verifyNip98,
+  type RuntimeOverrides,
+} from './admin.js';
 
 const log = createLogger('http');
 
@@ -62,12 +74,24 @@ export class HttpServer {
 
   private handle(req: IncomingMessage, res: ServerResponse): void {
     const url = req.url ?? '/';
+    const method = (req.method ?? 'GET').toUpperCase();
 
-    if (req.method === 'POST' && (url === '/test/inject' || url.startsWith('/test/inject?'))) {
+    if (method === 'POST' && (url === '/test/inject' || url.startsWith('/test/inject?'))) {
       return void this.handleTestInject(req, res);
     }
+    if (url === '/admin' || url === '/admin/' || url.startsWith('/admin/ui')) {
+      return this.handleAdminUi(req, res, url);
+    }
+    if (url === '/admin/state' || url.startsWith('/admin/state?')) {
+      if (method === 'GET') return void this.handleAdminGet(req, res);
+      if (method === 'PUT') return void this.handleAdminPut(req, res);
+      return json(res, 405, { error: 'method not allowed' });
+    }
+    if (url === '/admin/restart' && method === 'POST') {
+      return void this.handleAdminRestart(req, res);
+    }
 
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (method !== 'GET' && method !== 'HEAD') {
       return json(res, 405, { error: 'method not allowed' });
     }
 
@@ -81,6 +105,143 @@ export class HttpServer {
       return this.handleRooms(res);
     }
     json(res, 404, { error: 'not found' });
+  }
+
+  private fullUrl(req: IncomingMessage): string {
+    const host = req.headers.host ?? 'localhost';
+    const proto = (req.headers['x-forwarded-proto'] as string) ?? 'https';
+    return `${proto}://${host}${req.url ?? '/'}`;
+  }
+
+  private authOrFail(req: IncomingMessage, res: ServerResponse, method: string): string | null {
+    try {
+      const pubkey = verifyNip98(req.headers.authorization, method, this.fullUrl(req));
+      const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
+      if (pubkey !== op) {
+        json(res, 403, { error: 'not the operator', operator: op });
+        return null;
+      }
+      return pubkey;
+    } catch (err) {
+      const e = err as AuthError;
+      json(res, e.status ?? 401, { error: e.message });
+      return null;
+    }
+  }
+
+  private handleAdminGet(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.authOrFail(req, res, 'GET')) return;
+    json(res, 200, this.adminSnapshot());
+  }
+
+  private async handleAdminPut(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.authOrFail(req, res, 'PUT')) return;
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let patch: RuntimeOverrides;
+    try {
+      patch = JSON.parse(body) as RuntimeOverrides;
+    } catch {
+      return json(res, 400, { error: 'invalid json body' });
+    }
+    if (patch.relays) {
+      for (const u of patch.relays) {
+        if (!u.startsWith('wss://') && !u.startsWith('ws://')) {
+          return json(res, 400, { error: `relays contains non-ws URL: ${u}` });
+        }
+      }
+      if (patch.relays.length === 0) {
+        return json(res, 400, { error: 'relays must list at least one URL' });
+      }
+    }
+    if (patch.trustedAuthorRelays) {
+      for (const u of patch.trustedAuthorRelays) {
+        if (!u.startsWith('wss://') && !u.startsWith('ws://')) {
+          return json(res, 400, { error: `trustedAuthorRelays contains non-ws URL: ${u}` });
+        }
+      }
+    }
+    if (patch.allowed) {
+      for (const pk of patch.allowed) {
+        if (!/^[0-9a-f]{64}$/i.test(pk)) {
+          return json(res, 400, { error: `invalid allowed pubkey: ${pk}` });
+        }
+      }
+    }
+    if (patch.operatorPubkey && !/^[0-9a-f]{64}$/i.test(patch.operatorPubkey)) {
+      return json(res, 400, { error: 'operatorPubkey must be 64-char hex' });
+    }
+
+    const merged: RuntimeOverrides = { ...loadRuntimeOverrides(), ...patch };
+    saveRuntimeOverrides(merged);
+    applyOverrides(this.deps.cfg, merged);
+    log.info('admin overrides applied', { keys: Object.keys(patch) });
+    json(res, 200, { ok: true, applied: Object.keys(patch), state: this.adminSnapshot() });
+  }
+
+  private handleAdminRestart(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.authOrFail(req, res, 'POST')) return;
+    json(res, 200, { ok: true, restarting: true });
+    log.info('admin requested restart');
+    setTimeout(() => process.exit(0), 250);
+  }
+
+  private adminSnapshot() {
+    const cfg = this.deps.cfg;
+    return {
+      pubkey: this.deps.sfuPubkey,
+      operator: effectiveOperator(cfg, this.deps.sfuPubkey),
+      relays: cfg.relays,
+      trustedAuthorRelays: cfg.trustedAuthorRelays,
+      allowed: [...cfg.allowedPubkeys],
+      allowAll: cfg.allowAll,
+      publicUrl: cfg.publicUrl,
+      region: cfg.region,
+      maxRooms: cfg.maxRooms,
+      maxParticipantsPerRoom: cfg.maxParticipantsPerRoom,
+      engine: cfg.engine,
+      bootedAt: this.deps.bootedAt,
+      activeRooms: this.deps.rooms.list().map((r) => ({
+        channelId: r.channelId,
+        status: r.status,
+        participants: r.participants.length,
+        host: r.hostPubkey,
+        startedAt: r.startedAt,
+      })),
+    };
+  }
+
+  private handleAdminUi(_req: IncomingMessage, res: ServerResponse, url: string): void {
+    // Static admin UI lives next to dist/ at admin-ui/. Resolve relative to
+    // this compiled file so it works under both `node dist/index.js` and
+    // `tsx watch src/index.ts`.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const baseGuess = [
+      resolve(here, '../admin-ui'),       // dist/ → ../admin-ui
+      resolve(here, '../../admin-ui'),    // src/  → ../../admin-ui (dev)
+    ].find(existsSync);
+    if (!baseGuess) {
+      return json(res, 500, { error: 'admin-ui not found on disk' });
+    }
+    let rel = url.replace(/^\/admin\/?(ui\/?)?/, '') || 'index.html';
+    if (rel === '' || rel === '/') rel = 'index.html';
+    rel = rel.split('?')[0]!.split('#')[0]!;
+    if (rel.includes('..')) return json(res, 400, { error: 'bad path' });
+    const file = resolve(baseGuess, rel);
+    if (!file.startsWith(baseGuess) || !existsSync(file)) {
+      return json(res, 404, { error: 'not found' });
+    }
+    const ct: Record<string, string> = {
+      '.html': 'text/html; charset=utf-8',
+      '.js': 'text/javascript; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png',
+      '.ico': 'image/x-icon',
+    };
+    const type = ct[extname(file).toLowerCase()] ?? 'application/octet-stream';
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+    res.end(readFileSync(file));
   }
 
   /**

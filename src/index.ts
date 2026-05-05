@@ -26,12 +26,17 @@ import { RelayPool } from './relay.js';
 import { RoomManager } from './room-manager.js';
 import { createMediasoupEngine, type MediasoupEngine } from './mediasoup-server.js';
 import { loadConfig, reloadAllowList, type Config } from './config.js';
+import { applyOverrides, loadRuntimeOverrides } from './admin.js';
 
 const log = createLogger('main');
 
 async function main(): Promise<void> {
   const bootedAt = Math.floor(Date.now() / 1000);
   const cfg: Config = loadConfig();
+  // Layer admin-ui-driven overrides on top of env. Lives in runtime.json
+  // and is the source of truth for relay/allow-list edits made via the
+  // admin panel. .env stays as the operator's static baseline.
+  applyOverrides(cfg, loadRuntimeOverrides());
   const identity = createIdentity(cfg.nsecHex);
 
   log.info('boot', {

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Obelisk SFU — Admin</title>
+<style>
+  :root {
+    --lc-black: #0a0a0a;
+    --lc-dark: #171717;
+    --lc-border: #262626;
+    --lc-green: #b4f953;
+    --lc-white: #fafafa;
+    --lc-muted: #a3a3a3;
+    --lc-red: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--lc-black); color: var(--lc-white); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body {
+    min-height: 100vh;
+    background-image: linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  main { max-width: 880px; margin: 0 auto; padding: 32px 20px 80px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: .02em; }
+  h1 .acc { color: var(--lc-green); }
+  h2 { margin: 0 0 12px; font-size: 14px; letter-spacing: .12em; text-transform: uppercase; color: var(--lc-muted); }
+  .card { background: var(--lc-dark); border: 1px solid var(--lc-border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .pill {
+    border: none; cursor: pointer; padding: 8px 16px; border-radius: 9999px;
+    background: var(--lc-border); color: var(--lc-white); font-size: 13px; font-weight: 600;
+    transition: opacity .15s;
+  }
+  .pill:hover { opacity: .85; }
+  .pill[disabled] { opacity: .4; cursor: not-allowed; }
+  .pill-primary { background: var(--lc-green); color: #0a0a0a; }
+  .pill-danger { background: var(--lc-red); color: var(--lc-white); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .muted { color: var(--lc-muted); }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 8px 16px; align-items: baseline; }
+  .kv > div:nth-child(odd) { color: var(--lc-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .kv > div:nth-child(even) { word-break: break-all; }
+  textarea, input[type="text"] {
+    width: 100%; background: var(--lc-black); color: var(--lc-white);
+    border: 1px solid var(--lc-border); border-radius: 8px; padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  }
+  textarea:focus, input:focus { outline: 2px solid var(--lc-green); outline-offset: -2px; }
+  textarea { resize: vertical; min-height: 60px; }
+  label { font-size: 12px; color: var(--lc-muted); text-transform: uppercase; letter-spacing: .08em; display: block; margin-bottom: 6px; }
+  .field { margin-bottom: 14px; }
+  .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--lc-dark); border: 1px solid var(--lc-border); padding: 10px 16px; border-radius: 9999px; font-size: 13px; }
+  .toast.ok { border-color: var(--lc-green); color: var(--lc-green); }
+  .toast.err { border-color: var(--lc-red); color: var(--lc-red); }
+  details { border: 1px solid var(--lc-border); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
+  summary { cursor: pointer; font-size: 13px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; background: var(--lc-border); color: var(--lc-muted); }
+  .badge.live { background: var(--lc-green); color: #0a0a0a; }
+  .err { color: var(--lc-red); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Obelisk <span class="acc">SFU</span> · Admin</h1>
+    <div id="auth-state" class="row"></div>
+  </header>
+
+  <section id="login-card" class="card" style="display:none">
+    <h2>Sign in</h2>
+    <p class="muted">Authenticate with your Nostr browser extension. Only the SFU's operator pubkey is allowed.</p>
+    <button id="login-btn" class="pill pill-primary">Connect with NIP-07</button>
+    <p id="login-err" class="err mono" style="margin-top:12px"></p>
+  </section>
+
+  <section id="state-card" class="card" style="display:none">
+    <h2>Identity</h2>
+    <div class="kv">
+      <div>SFU pubkey</div>      <div class="mono" id="f-pubkey"></div>
+      <div>SFU npub</div>        <div class="mono" id="f-npub"></div>
+      <div>Operator</div>        <div class="mono" id="f-operator"></div>
+      <div>Public URL</div>      <div class="mono" id="f-publicUrl"></div>
+      <div>Region</div>          <div class="mono" id="f-region"></div>
+      <div>Engine</div>          <div class="mono" id="f-engine"></div>
+      <div>Capacity</div>        <div class="mono" id="f-cap"></div>
+    </div>
+  </section>
+
+  <section id="settings-card" class="card" style="display:none">
+    <h2>Settings</h2>
+    <p class="muted">Changes to <span class="mono">relays</span> and <span class="mono">trusted-author relays</span> require a restart (button below). Allow-list and allow-all hot-swap.</p>
+    <div class="field">
+      <label>Listening relays (comma or newline separated, wss://)</label>
+      <textarea id="i-relays" rows="2"></textarea>
+    </div>
+    <div class="field">
+      <label>Trusted-author relays</label>
+      <textarea id="i-trusted" rows="2"></textarea>
+    </div>
+    <div class="field">
+      <label>Allowed pubkeys (hex, one per line)</label>
+      <textarea id="i-allowed" rows="3"></textarea>
+    </div>
+    <div class="field row">
+      <input type="checkbox" id="i-allowAll" />
+      <label for="i-allowAll" style="margin:0">Allow all (testing only — bypasses allow-list)</label>
+    </div>
+    <div class="field">
+      <label>Public URL (advertised in kind 31313)</label>
+      <input type="text" id="i-publicUrl" />
+    </div>
+    <div class="field">
+      <label>Region hint</label>
+      <input type="text" id="i-region" />
+    </div>
+    <div class="field">
+      <label>Operator pubkey (hex)</label>
+      <input type="text" id="i-operator" />
+      <p class="muted mono" style="font-size:11px;margin:6px 0 0">⚠ Changing this locks you out unless you control the new key.</p>
+    </div>
+    <div class="row">
+      <button id="save-btn" class="pill pill-primary">Save</button>
+      <button id="restart-btn" class="pill pill-danger">Restart SFU</button>
+      <button id="refresh-btn" class="pill">Refresh</button>
+    </div>
+  </section>
+
+  <section id="rooms-card" class="card" style="display:none">
+    <h2>Active rooms</h2>
+    <div id="rooms-list"></div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script type="importmap">
+  { "imports": { "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19" } }
+</script>
+
+<script type="module">
+  import * as nip19 from 'nostr-tools/nip19';
+
+  const $ = (id) => document.getElementById(id);
+  const log = (...a) => console.log('[admin]', ...a);
+
+  let myPubkey = null;
+  let snapshot = null;
+
+  function toast(msg, kind) {
+    const t = $('toast');
+    t.innerHTML = `<div class="toast ${kind || ''}">${msg}</div>`;
+    setTimeout(() => { t.innerHTML = ''; }, 3000);
+  }
+
+  function ensureNip07() {
+    if (typeof window.nostr !== 'object' || !window.nostr) {
+      throw new Error('No NIP-07 extension found. Install Alby, nos2x, or similar.');
+    }
+  }
+
+  async function makeNip98Header(method, url) {
+    ensureNip07();
+    const tmpl = {
+      kind: 27235,
+      created_at: Math.floor(Date.now() / 1000),
+      content: '',
+      tags: [['u', url], ['method', method.toUpperCase()]],
+    };
+    const signed = await window.nostr.signEvent(tmpl);
+    return 'Nostr ' + btoa(JSON.stringify(signed));
+  }
+
+  async function api(path, method = 'GET', body) {
+    const url = window.location.origin + path;
+    const init = {
+      method,
+      headers: { 'Authorization': await makeNip98Header(method, url) },
+    };
+    if (body !== undefined) {
+      init.headers['content-type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, init);
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { error: text }; }
+    if (!res.ok) throw new Error(`${res.status} ${parsed.error || 'request failed'}`);
+    return parsed;
+  }
+
+  async function login() {
+    $('login-err').textContent = '';
+    try {
+      ensureNip07();
+      myPubkey = await window.nostr.getPublicKey();
+      log('logged in as', myPubkey);
+      await refresh();
+      $('login-card').style.display = 'none';
+      $('state-card').style.display = '';
+      $('settings-card').style.display = '';
+      $('rooms-card').style.display = '';
+      $('auth-state').innerHTML = `<span class="badge live">●</span> <span class="mono">${nip19.npubEncode(myPubkey)}</span>`;
+    } catch (err) {
+      $('login-err').textContent = err.message;
+    }
+  }
+
+  async function refresh() {
+    snapshot = await api('/admin/state', 'GET');
+    render(snapshot);
+  }
+
+  function render(s) {
+    $('f-pubkey').textContent = s.pubkey;
+    $('f-npub').textContent = nip19.npubEncode(s.pubkey);
+    $('f-operator').textContent = `${s.operator}\n(${nip19.npubEncode(s.operator)})`;
+    $('f-publicUrl').textContent = s.publicUrl || '—';
+    $('f-region').textContent = s.region || '—';
+    $('f-engine').textContent = s.engine;
+    $('f-cap').textContent = `${s.maxParticipantsPerRoom}/room · ${s.maxRooms} concurrent`;
+
+    $('i-relays').value = s.relays.join('\n');
+    $('i-trusted').value = s.trustedAuthorRelays.join('\n');
+    $('i-allowed').value = s.allowed.join('\n');
+    $('i-allowAll').checked = !!s.allowAll;
+    $('i-publicUrl').value = s.publicUrl || '';
+    $('i-region').value = s.region || '';
+    $('i-operator').value = s.operator || '';
+
+    const list = $('rooms-list');
+    if (!s.activeRooms || s.activeRooms.length === 0) {
+      list.innerHTML = '<p class="muted">No active rooms.</p>';
+    } else {
+      list.innerHTML = s.activeRooms.map((r) => `
+        <details>
+          <summary>
+            <span class="mono">${r.channelId.slice(0, 16)}…</span>
+            · <span class="badge live">${r.status}</span>
+            · ${r.participants} participants
+          </summary>
+          <div class="kv" style="margin-top:8px">
+            <div>Host</div><div class="mono">${r.host || '—'}</div>
+            <div>Started</div><div class="mono">${new Date(r.startedAt * 1000).toISOString()}</div>
+          </div>
+        </details>
+      `).join('');
+    }
+  }
+
+  function parseLines(s) {
+    return s.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+  }
+
+  async function save() {
+    if (!confirm('Save changes to runtime.json? Allow-list / allow-all apply immediately; relay changes need a restart.')) return;
+    const patch = {
+      relays: parseLines($('i-relays').value),
+      trustedAuthorRelays: parseLines($('i-trusted').value),
+      allowed: parseLines($('i-allowed').value),
+      allowAll: $('i-allowAll').checked,
+      publicUrl: $('i-publicUrl').value.trim() || null,
+      region: $('i-region').value.trim() || null,
+      operatorPubkey: $('i-operator').value.trim().toLowerCase() || null,
+    };
+    try {
+      await api('/admin/state', 'PUT', patch);
+      toast('Saved', 'ok');
+      await refresh();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function restart() {
+    if (!confirm('Restart the SFU process? Active calls will drop.')) return;
+    try {
+      await api('/admin/restart', 'POST');
+      toast('Restart requested. Reconnecting in 3 s…', 'ok');
+      setTimeout(() => window.location.reload(), 3000);
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  $('login-btn').addEventListener('click', login);
+  $('save-btn').addEventListener('click', save);
+  $('restart-btn').addEventListener('click', restart);
+  $('refresh-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));
+
+  // Auto-attempt login if NIP-07 is available — most operators have it.
+  if (typeof window.nostr === 'object' && window.nostr) {
+    login().catch(() => { $('login-card').style.display = ''; });
+  } else {
+    $('login-card').style.display = '';
+  }
+</script>
+</body>
+</html>
