@@ -435,15 +435,27 @@ export class MediasoupRoom {
       const direction = data.direction === 'recv' ? 'recv' : 'send';
       const peer = this.getOrCreatePeer(ctx.fromPubkey);
       const existing = direction === 'send' ? peer.sendTransport : peer.recvTransport;
+      // On browser reload the dex re-issues createWebRtcTransport for the same
+      // peer. Idempotently returning the old transport leaves the browser
+      // with stale DTLS keys; close + recreate so handshake succeeds, and
+      // also drop any consumers tied to the dead recv transport so they
+      // can be re-issued by the existing-producer broadcast below.
       if (existing) {
-        // Idempotent — return the same transport's params if the client
-        // re-asks (browser refresh, retry on dropped relay).
-        return {
-          id: existing.id,
-          iceParameters: existing.iceParameters,
-          iceCandidates: existing.iceCandidates,
-          dtlsParameters: existing.dtlsParameters,
-        };
+        try { existing.close(); } catch { /* already closed */ }
+        if (direction === 'send') {
+          for (const [pid, producer] of peer.producers) {
+            try { producer.close(); } catch { /* ignore */ }
+            peer.producers.delete(pid);
+            peer.producerAppData.delete(pid);
+          }
+          delete peer.sendTransport;
+        } else {
+          for (const [cid, consumer] of peer.consumers) {
+            try { consumer.close(); } catch { /* ignore */ }
+            peer.consumers.delete(cid);
+          }
+          delete peer.recvTransport;
+        }
       }
       const transport = await this.router.createWebRtcTransport(
         this.engine.webRtcTransportOptions(),
@@ -459,7 +471,8 @@ export class MediasoupRoom {
       else peer.recvTransport = transport;
 
       // When the peer's recv transport comes online, push notifications for
-      // every existing producer so the client knows what to consume.
+      // every existing producer so the client knows what to consume. Fires
+      // on first connect AND on reload, since we close+recreate above.
       if (direction === 'recv') {
         for (const other of this.peers.values()) {
           if (other.pubkey === ctx.fromPubkey) continue;
