@@ -195,6 +195,7 @@ export class MediasoupRoom {
     // Track it on a synthetic peer record under the origin pubkey so
     // `consume` can find the appData.
     let synthetic = this.peers.get(opts.originPubkey);
+    const isNewSyntheticPeer = !synthetic;
     if (!synthetic) {
       synthetic = {
         pubkey: opts.originPubkey,
@@ -206,6 +207,22 @@ export class MediasoupRoom {
     }
     synthetic.producers.set(producer.id, producer);
     synthetic.producerAppData.set(producer.id, meta);
+
+    // First time we've seen this synthetic origin pubkey — announce it as
+    // a new participant so every recv-transport-bearing peer adds the
+    // tile to their roster. Without this, test injectors stream media
+    // through `newProducer` but never appear in the participant list,
+    // because they don't drive the recv-transport handler that normally
+    // emits `peerJoined`.
+    if (isNewSyntheticPeer) {
+      for (const other of this.peers.values()) {
+        if (other.pubkey === opts.originPubkey) continue;
+        if (!other.recvTransport) continue;
+        void this.sendNotification(other.pubkey, 'peerJoined', {
+          pubkey: opts.originPubkey,
+        });
+      }
+    }
 
     return {
       transportId: transport.id,
@@ -227,10 +244,35 @@ export class MediasoupRoom {
     const peer = this.peers.get(targetPubkey);
     if (!peer) return;
     log.info('kick', { target: targetPubkey.slice(0, 8), reason: reason ?? '' });
+    // Remove from the peer table BEFORE closing so the transport-close
+    // observer's `peers.get(pubkey) === peer` guard short-circuits and we
+    // don't double-publish `peerLeft` from both this method and the
+    // observer.
+    this.peers.delete(targetPubkey);
     try { peer.sendTransport?.close(); } catch { /* ignore */ }
     try { peer.recvTransport?.close(); } catch { /* ignore */ }
-    this.peers.delete(targetPubkey);
     await this.sendNotification(targetPubkey, 'kicked', { reason: reason ?? null });
+    this.fanoutPeerLeft(targetPubkey);
+  }
+
+  /**
+   * Centralized "this peer is gone from the room" handler. Removes them
+   * from `this.peers` and fans out `peerLeft` to everyone else with a recv
+   * transport. Called from the transport-close observer (organic
+   * disconnect) and from `kick` (admin action, after the peer is already
+   * removed — second call is a no-op thanks to the .get() guard).
+   */
+  private handlePeerLeft(pubkey: Hex): void {
+    if (!this.peers.delete(pubkey)) return;
+    log.info('peer left', { peer: pubkey.slice(0, 8) });
+    this.fanoutPeerLeft(pubkey);
+  }
+
+  private fanoutPeerLeft(pubkey: Hex): void {
+    for (const other of this.peers.values()) {
+      if (!other.recvTransport) continue;
+      void this.sendNotification(other.pubkey, 'peerLeft', { pubkey });
+    }
   }
 
   snapshot(): RoomSnapshot {
@@ -467,13 +509,44 @@ export class MediasoupRoom {
           });
         }
       });
+      // When BOTH transports of a peer have closed organically (DTLS death,
+      // ICE failure, router teardown), treat the peer as having left and
+      // fan out `peerLeft` to the rest of the room. The reference-equality
+      // guard `peer.X === transport` keeps us out of the close+recreate path
+      // above, which clears the field BEFORE re-allocation.
+      transport.observer.on('close', () => {
+        const isStillSend = peer.sendTransport === transport;
+        const isStillRecv = peer.recvTransport === transport;
+        if (!isStillSend && !isStillRecv) return; // already swapped out
+        if (isStillSend) delete peer.sendTransport;
+        if (isStillRecv) delete peer.recvTransport;
+        if (!peer.sendTransport && !peer.recvTransport && this.peers.get(peer.pubkey) === peer) {
+          this.handlePeerLeft(peer.pubkey);
+        }
+      });
       if (direction === 'send') peer.sendTransport = transport;
       else peer.recvTransport = transport;
 
-      // When the peer's recv transport comes online, push notifications for
-      // every existing producer so the client knows what to consume. Fires
-      // on first connect AND on reload, since we close+recreate above.
+      // When the peer's recv transport comes online, push the current
+      // participant list + every existing producer so the client knows
+      // what to render and what to consume. Then fan out `peerJoined` to
+      // every other peer with a recv transport so their roster updates.
+      // Fires on first connect AND on reload (close+recreate path above).
+      //
+      // The participant list includes ANY peer in `this.peers`, not just
+      // those with their own recv transport. This catches synthetic peers
+      // (test injectors that publish via PlainTransport without an SFU
+      // recv channel) — they're still real participants from the
+      // perspective of every browser-side user, and the dex needs them
+      // in the roster to render their tile.
       if (direction === 'recv') {
+        const otherPubkeys: Hex[] = [];
+        for (const other of this.peers.values()) {
+          if (other.pubkey === ctx.fromPubkey) continue;
+          otherPubkeys.push(other.pubkey);
+        }
+        void ctx.notify('participantList', { pubkeys: otherPubkeys });
+
         for (const other of this.peers.values()) {
           if (other.pubkey === ctx.fromPubkey) continue;
           for (const [, producer] of other.producers) {
@@ -484,6 +557,14 @@ export class MediasoupRoom {
               appData: meta ?? null,
             });
           }
+        }
+
+        for (const other of this.peers.values()) {
+          if (other.pubkey === ctx.fromPubkey) continue;
+          if (!other.recvTransport) continue;
+          void this.sendNotification(other.pubkey, 'peerJoined', {
+            pubkey: ctx.fromPubkey,
+          });
         }
       }
 
