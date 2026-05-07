@@ -2,6 +2,11 @@
 
 Standalone Node service that acts as an opt-in SFU (selective forwarding unit) for Obelisk voice channels. It speaks the same Nostr signaling wire as mesh calls (kinds 20078 + 25050), advertises itself on Nostr (kind 31313), and accepts call-control events (kind 25052) from a hand-picked allow-list of pubkeys.
 
+<p>
+  <a href="https://github.com/obelisk-app/obelisk-sfu/stargazers"><img src="https://img.shields.io/github/stars/obelisk-app/obelisk-sfu?style=flat&logo=github&color=b4f953&labelColor=0a0a0a" alt="GitHub stars" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/obelisk-app/obelisk-sfu?style=flat&color=b4f953&labelColor=0a0a0a" alt="License" /></a>
+</p>
+
 **Read first:**
 - [docs/sfu-system.md](docs/sfu-system.md) — full architecture and event spec.
 - [DEPLOY.md](DEPLOY.md) — **production deploy procedure** (firewall, systemd, Cloudflare tunnel, verification, rollback). Use this if you're shipping the service to a real host.
@@ -10,12 +15,23 @@ This README is the day-to-day operator runbook: dev setup, log greps, nak recipe
 
 > **v0.** Audio forwarding works at small scale. Production hardening punch-list is in [docs/sfu-system.md §10](docs/sfu-system.md#10-whats-not-in-v0-production-hardening-punch-list).
 
+## The Obelisk family
+
+| Repo | What |
+|------|------|
+| [obelisk-app/obelisk](https://github.com/obelisk-app/obelisk) | The chat app — switches to this SFU when a kind 31313 advertisement is reachable |
+| [obelisk-app/obelisk-relay](https://github.com/obelisk-app/obelisk-relay) | NIP-29 groups relay |
+| [**obelisk-app/obelisk-sfu**](https://github.com/obelisk-app/obelisk-sfu) | This repo — mediasoup SFU for voice |
+| [obelisk-app/obelisk-bots](https://github.com/obelisk-app/obelisk-bots) | Nostr bots toolkit |
+| [obelisk-app/obelisk-classic](https://github.com/obelisk-app/obelisk-classic) | The original centralized stack |
+
 ---
 
 ## TL;DR
 
 ```bash
-cd services/sfu
+git clone https://github.com/obelisk-app/obelisk-sfu.git
+cd obelisk-sfu
 ./scripts/setup.sh              # installs deps, generates a keypair, writes .env
 
 # Edit .env  — at minimum set SFU_PUBLIC_URL and SFU_RELAYS
