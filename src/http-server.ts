@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { createLogger } from './log.js';
 import type { Config } from './config.js';
 import type { RoomManager } from './room-manager.js';
+import type { TestPeerSpawner } from './test-peer-spawner.js';
 import {
   AuthError,
   applyOverrides,
@@ -37,6 +38,12 @@ export interface HttpServerDeps {
   sfuPubkey: string;
   rooms: RoomManager;
   bootedAt: number;
+  /**
+   * Optional test-peer spawner — exposed at /admin/test-peer/* when present.
+   * Mediasoup-only (the spawned script needs the PlainTransport injection
+   * path that the werift engine doesn't implement).
+   */
+  testPeers: TestPeerSpawner | null;
 }
 
 export class HttpServer {
@@ -90,13 +97,25 @@ export class HttpServer {
     if (url === '/admin/restart' && method === 'POST') {
       return void this.handleAdminRestart(req, res);
     }
+    if (url === '/admin/test-peers' && method === 'GET') {
+      return void this.handleTestPeerList(req, res);
+    }
+    if (url === '/admin/test-peer/spawn' && method === 'POST') {
+      return void this.handleTestPeerSpawn(req, res);
+    }
+    if (url === '/admin/test-peer/stop' && method === 'POST') {
+      return void this.handleTestPeerStop(req, res);
+    }
 
     if (method !== 'GET' && method !== 'HEAD') {
       return json(res, 405, { error: 'method not allowed' });
     }
 
     if (url === '/' || url.startsWith('/?')) {
-      return this.handleRoot(res);
+      return this.handleRoot(req, res);
+    }
+    if (url === '/info' || url.startsWith('/info?')) {
+      return this.handleInfo(res);
     }
     if (url === '/healthz' || url.startsWith('/healthz?')) {
       return this.handleHealth(res);
@@ -186,6 +205,59 @@ export class HttpServer {
     setTimeout(() => process.exit(0), 250);
   }
 
+  private handleTestPeerList(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.authOrFail(req, res, 'GET')) return;
+    if (!this.deps.testPeers) {
+      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+    }
+    json(res, 200, { peers: this.deps.testPeers.list() });
+  }
+
+  private async handleTestPeerSpawn(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.authOrFail(req, res, 'POST')) return;
+    if (!this.deps.testPeers) {
+      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let data: { channelId?: string; relays?: string[] };
+    try { data = JSON.parse(body) as typeof data; }
+    catch { return json(res, 400, { error: 'invalid json' }); }
+    const channelId = (data.channelId ?? '').trim().toLowerCase();
+    if (!/^[0-9a-f]+$/.test(channelId)) {
+      return json(res, 400, { error: 'channelId must be hex' });
+    }
+    if (data.relays !== undefined && !Array.isArray(data.relays)) {
+      return json(res, 400, { error: 'relays must be an array of ws:// or wss:// URLs' });
+    }
+    try {
+      const info = this.deps.testPeers.spawn(channelId, data.relays ? { relays: data.relays } : {});
+      log.info('admin spawned test peer', {
+        peerId: info.peerId, channel: channelId.slice(0, 8), relays: info.relays.length,
+      });
+      json(res, 200, info);
+    } catch (err) {
+      json(res, 500, { error: (err as Error).message });
+    }
+  }
+
+  private async handleTestPeerStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.authOrFail(req, res, 'POST')) return;
+    if (!this.deps.testPeers) {
+      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let data: { peerId?: string };
+    try { data = JSON.parse(body) as typeof data; }
+    catch { return json(res, 400, { error: 'invalid json' }); }
+    const peerId = (data.peerId ?? '').trim();
+    if (!peerId) return json(res, 400, { error: 'peerId required' });
+    const ok = this.deps.testPeers.stop(peerId);
+    if (!ok) return json(res, 404, { error: 'unknown peerId' });
+    json(res, 200, { ok: true });
+  }
+
   private adminSnapshot() {
     const cfg = this.deps.cfg;
     return {
@@ -195,6 +267,7 @@ export class HttpServer {
       trustedAuthorRelays: cfg.trustedAuthorRelays,
       allowed: [...cfg.allowedPubkeys],
       allowAll: cfg.allowAll,
+      requireAllowedPubkey: cfg.requireAllowedPubkey,
       publicUrl: cfg.publicUrl,
       region: cfg.region,
       maxRooms: cfg.maxRooms,
@@ -208,6 +281,7 @@ export class HttpServer {
         host: r.hostPubkey,
         startedAt: r.startedAt,
       })),
+      testPeers: this.deps.testPeers ? this.deps.testPeers.list() : null,
     };
   }
 
@@ -283,20 +357,147 @@ export class HttpServer {
     }
   }
 
-  private handleRoot(res: ServerResponse): void {
+  /**
+   * GET / — serves the public landing page (HTML) for browsers, or the
+   * machine-readable JSON service descriptor for non-browser clients.
+   * Browsers detected via Accept: text/html. Anything else (curl with
+   * no Accept, kind 31313 consumers, monitoring probes) keeps getting
+   * the JSON they had before, so this is a non-breaking change.
+   *
+   * The same JSON is also at /info unconditionally for clients that
+   * want to bypass the negotiation.
+   */
+  private handleRoot(req: IncomingMessage, res: ServerResponse): void {
+    const accept = (req.headers.accept ?? '').toLowerCase();
+    const wantsHtml = accept.includes('text/html');
+    if (wantsHtml) {
+      return this.handleLanding(res);
+    }
+    this.handleInfo(res);
+  }
+
+  private handleInfo(res: ServerResponse): void {
     json(res, 200, {
       service: 'obelisk-sfu',
       version: '0.1.0',
       pubkey: this.deps.sfuPubkey,
       url: this.deps.cfg.publicUrl,
       relays: this.deps.cfg.relays,
+      trustedAuthorRelays: this.deps.cfg.trustedAuthorRelays,
       cap: this.deps.cfg.maxParticipantsPerRoom,
       maxRooms: this.deps.cfg.maxRooms,
       codecs: ['opus', 'vp9', 'h264'],
       operator: this.deps.cfg.operatorPubkey ?? this.deps.sfuPubkey,
       region: this.deps.cfg.region,
       bootedAt: this.deps.bootedAt,
+      activeRooms: this.deps.rooms.size(),
     });
+  }
+
+  private handleLanding(res: ServerResponse): void {
+    // Same La Crypta theme + grid backdrop the admin UI uses, but the
+    // payload is read-only and unauthenticated. The JSON descriptor is
+    // still reachable at /info; this is the human-friendly view.
+    const cfg = this.deps.cfg;
+    const ops = cfg.operatorPubkey ?? this.deps.sfuPubkey;
+    const uptime = Math.max(0, Math.floor(Date.now() / 1000) - this.deps.bootedAt);
+    const escape = (s: string) => s.replace(/[&<>"]/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+    }[c] as string));
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Obelisk SFU</title>
+<style>
+  :root {
+    --lc-black: #0a0a0a;
+    --lc-dark: #171717;
+    --lc-border: #262626;
+    --lc-green: #b4f953;
+    --lc-white: #fafafa;
+    --lc-muted: #a3a3a3;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--lc-black); color: var(--lc-white); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body {
+    min-height: 100vh;
+    background-image: linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 64px 20px 80px; }
+  .hero { text-align: center; margin-bottom: 32px; }
+  .hero h1 { margin: 0; font-size: 40px; letter-spacing: .02em; }
+  .hero h1 .acc { color: var(--lc-green); }
+  .hero p { margin: 12px auto 0; max-width: 520px; color: var(--lc-muted); font-size: 14px; line-height: 1.5; }
+  .pill {
+    display: inline-block; padding: 10px 20px; border-radius: 9999px;
+    background: var(--lc-green); color: var(--lc-black); font-size: 14px; font-weight: 600;
+    text-decoration: none; margin: 16px 6px 0;
+    transition: opacity .15s;
+  }
+  .pill:hover { opacity: .85; }
+  .pill.secondary { background: var(--lc-border); color: var(--lc-white); }
+  .card { background: var(--lc-dark); border: 1px solid var(--lc-border); border-radius: 12px; padding: 20px; margin-top: 20px; }
+  h2 { margin: 0 0 12px; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--lc-muted); }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; align-items: baseline; font-size: 13px; }
+  .kv > div:nth-child(odd) { color: var(--lc-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .kv > div:nth-child(even) { word-break: break-all; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; background: var(--lc-green); color: var(--lc-black); margin-left: 8px; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  ul li { padding: 4px 0; font-size: 12px; color: var(--lc-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  footer { margin-top: 48px; text-align: center; color: var(--lc-muted); font-size: 12px; }
+  footer a { color: var(--lc-muted); text-decoration: underline; }
+</style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <h1>Obelisk <span class="acc">SFU</span></h1>
+    <p>Mediasoup-backed selective forwarding unit for Obelisk voice/video rooms. Nostr-signaled, allow-listed, operator-run.</p>
+    <a class="pill" href="/admin">Open admin</a>
+    <a class="pill secondary" href="/info">Service info (JSON)</a>
+  </section>
+
+  <section class="card">
+    <h2>Identity <span class="badge">live</span></h2>
+    <div class="kv">
+      <div>Pubkey</div><div class="mono">${escape(this.deps.sfuPubkey)}</div>
+      <div>Operator</div><div class="mono">${escape(ops)}</div>
+      <div>Public URL</div><div class="mono">${escape(cfg.publicUrl ?? '—')}</div>
+      <div>Region</div><div class="mono">${escape(cfg.region ?? '—')}</div>
+      <div>Engine</div><div class="mono">${escape(cfg.engine)}</div>
+      <div>Capacity</div><div class="mono">${cfg.maxParticipantsPerRoom}/room · ${cfg.maxRooms} rooms</div>
+      <div>Active rooms</div><div class="mono">${this.deps.rooms.size()}</div>
+      <div>Uptime</div><div class="mono">${uptime}s</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Relays</h2>
+    <ul>
+      ${cfg.relays.map((r) => `<li>· ${escape(r)}</li>`).join('')}
+    </ul>
+    ${cfg.trustedAuthorRelays.length > 0 ? `
+    <h2 style="margin-top:16px">Trusted-author relays</h2>
+    <ul>
+      ${cfg.trustedAuthorRelays.map((r) => `<li>· ${escape(r)}</li>`).join('')}
+    </ul>` : ''}
+  </section>
+
+  <footer>
+    Operator-run service · <a href="/info">/info</a> · <a href="/healthz">/healthz</a> · <a href="/rooms">/rooms</a>
+  </footer>
+</main>
+</body>
+</html>`;
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    res.end(html);
   }
 
   private handleHealth(res: ServerResponse): void {

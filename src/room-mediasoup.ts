@@ -36,9 +36,83 @@ import type { Hex, RoomRules, RoomSnapshot, RoomStatus } from './types.js';
 
 const log = createLogger('room-ms');
 
+/**
+ * Voice kinds the dex publishes. Bug #8 — keep this list explicit so
+ * any future appData sanitization layer doesn't accidentally drop
+ * `screen-audio` (which the dex uses for system-audio of a screenshare,
+ * e.g. browser tab audio). If a producer's appData carries an unknown
+ * kind, fall back to the safe default for the underlying media kind.
+ */
+const VALID_VOICE_KINDS: ReadonlyArray<'audio' | 'camera' | 'screen' | 'screen-audio'> = [
+  'audio',
+  'camera',
+  'screen',
+  'screen-audio',
+];
+
+function sanitizeVoiceKind(
+  raw: unknown,
+  mediaKind: 'audio' | 'video',
+): 'audio' | 'camera' | 'screen' | 'screen-audio' {
+  if (typeof raw === 'string'
+    && (VALID_VOICE_KINDS as ReadonlyArray<string>).includes(raw)) {
+    return raw as 'audio' | 'camera' | 'screen' | 'screen-audio';
+  }
+  return mediaKind === 'audio' ? 'audio' : 'camera';
+}
+
 const BEACON_INTERVAL_MS = 15_000;
 const ACTIVE_CALL_INTERVAL_MS = 60_000;
 const ACTIVE_CALL_TTL_SECONDS = 90;
+/**
+ * How long ICE or DTLS may stay disconnected/failed before we drop the
+ * peer (bug #6). 15 s — long enough to ride a typical wifi blip, short
+ * enough that a real disconnect doesn't leave a stale tile up.
+ */
+const TRANSPORT_UNHEALTHY_TIMEOUT_MS = 15_000;
+/**
+ * Activity-based reaper (bug #7) — how often to walk the peer table
+ * looking for stale entries.
+ */
+const REAPER_INTERVAL_MS = 5_000;
+/**
+ * Drop a peer whose latest inbound RTP packet (across any producer) was
+ * older than this. Long enough to ride a normal mute + brief jitter,
+ * short enough that a frozen tab clears within ~30 s.
+ */
+const RTP_INACTIVITY_TIMEOUT_MS = 30_000;
+/**
+ * For peers that joined but never published — still reap them after
+ * this many seconds of no RTP at all. Keeps zombie joins from holding
+ * a roster slot indefinitely.
+ */
+const NO_PRODUCER_TIMEOUT_MS = 45_000;
+
+/**
+ * Per-peer map key. Composed from pubkey + clientId so two devices
+ * sharing a Nostr pubkey produce distinct entries — the pre-multi-device
+ * code keyed on pubkey alone, which made the second device's
+ * `createWebRtcTransport` reuse + close the first device's transports.
+ */
+function peerKey(pubkey: Hex, clientId: string): string {
+  return `${pubkey}|${clientId}`;
+}
+
+/**
+ * Synthetic / test producers (admin-injected via /test/inject) don't have
+ * a real RPC connection, so they don't carry a clientId. We park them
+ * under this stable id so the peers map stays well-formed without
+ * colliding with any real client (clientIds are random hex strings).
+ */
+const SYNTHETIC_CLIENT_ID = '_synthetic';
+
+/**
+ * Stable clientId for legacy clients (pre-multi-device build) that don't
+ * include a `clientId` in their RPC envelopes. Two legacy devices for
+ * the same pubkey will still collide on the same slot — same as the old
+ * behavior — but we don't intentionally break them.
+ */
+const LEGACY_CLIENT_ID = '_legacy';
 
 export interface MediasoupRoomOptions {
   channelId: string;
@@ -53,6 +127,15 @@ export interface MediasoupRoomOptions {
 
 interface PeerState {
   pubkey: Hex;
+  /**
+   * Per-connection id minted by the client (a fresh hex string per
+   * SfuClient construction). Two devices sharing a Nostr pubkey produce
+   * two distinct PeerStates so transports/producers/consumers don't
+   * collide. Falls back to `'_legacy'` for old clients that didn't
+   * send the field — those keep the pre-multi-device behavior of
+   * collapsing onto one slot per pubkey.
+   */
+  clientId: string;
   /** WebRTC transport the peer publishes to (browser → SFU media). */
   sendTransport?: ms.WebRtcTransport;
   /** WebRTC transport the SFU pushes media on (SFU → browser). */
@@ -63,6 +146,24 @@ interface PeerState {
   consumers: Map<string, ms.Consumer>;
   /** Voice-level metadata per producer (camera vs screen, origin, etc.). */
   producerAppData: Map<string, { kind: 'audio' | 'camera' | 'screen' | 'screen-audio'; originPubkey: Hex }>;
+  /**
+   * Per-transport sweep timers — armed when ICE/DTLS goes bad, cancelled
+   * when it recovers. If still bad after `TRANSPORT_UNHEALTHY_TIMEOUT_MS`
+   * the peer is dropped via `handlePeerLeft`. Keyed by transport id.
+   */
+  unhealthyTimers: Map<string, ReturnType<typeof setTimeout>>;
+  /**
+   * Most recent time the reaper observed packetCount across all
+   * producers increase (ms since epoch). Drives the activity-based
+   * reaper (bug #7) — independent of ICE/DTLS health, since mobile
+   * background-throttle and OS suspend can keep a transport "healthy"
+   * while no actual RTP flows.
+   */
+  lastInboundPacketAt: number;
+  /** Sum of packetCount across producers as of `lastInboundPacketAt`. */
+  lastSeenPacketCount: number;
+  /** Created-at — used by the reaper as a fallback for joined-but-silent peers. */
+  joinedAt: number;
 }
 
 export class MediasoupRoom {
@@ -78,13 +179,26 @@ export class MediasoupRoom {
   private readonly onClosed: (channelId: string) => void;
 
   private router: ms.Router | null = null;
-  private readonly peers = new Map<Hex, PeerState>();
+  /**
+   * Active peers keyed by `peerKey(pubkey, clientId)` so two devices
+   * sharing a pubkey get distinct slots. Use {@link peerKey} for any
+   * map mutation; iteration via `.values()` continues to give back
+   * `PeerState`s and is unaffected by the keying change.
+   */
+  private readonly peers = new Map<string, PeerState>();
 
   private signalUnsub: (() => void) | null = null;
   private membershipRelease: (() => void) | null = null;
 
   private beaconTimer: ReturnType<typeof setInterval> | null = null;
   private activeCallTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Periodically walks `this.peers`, calls getStats() on each producer,
+   * and reaps peers whose packet count hasn't moved for
+   * `RTP_INACTIVITY_TIMEOUT_MS`. See bug #7 — only RTP flow is the
+   * ground truth for "is this peer actually doing anything."
+   */
+  private reaperTimer: ReturnType<typeof setInterval> | null = null;
 
   private _status: RoomStatus = 'starting';
   private startedAt = 0;
@@ -194,16 +308,23 @@ export class MediasoupRoom {
     // Also keep the producer alive: if the room closes we close it.
     // Track it on a synthetic peer record under the origin pubkey so
     // `consume` can find the appData.
-    let synthetic = this.peers.get(opts.originPubkey);
+    const syntheticKey = peerKey(opts.originPubkey, SYNTHETIC_CLIENT_ID);
+    let synthetic = this.peers.get(syntheticKey);
     const isNewSyntheticPeer = !synthetic;
     if (!synthetic) {
+      const now = Date.now();
       synthetic = {
         pubkey: opts.originPubkey,
+        clientId: SYNTHETIC_CLIENT_ID,
         producers: new Map(),
         consumers: new Map(),
         producerAppData: new Map(),
+        unhealthyTimers: new Map(),
+        lastInboundPacketAt: now,
+        lastSeenPacketCount: 0,
+        joinedAt: now,
       };
-      this.peers.set(opts.originPubkey, synthetic);
+      this.peers.set(syntheticKey, synthetic);
     }
     synthetic.producers.set(producer.id, producer);
     synthetic.producerAppData.set(producer.id, meta);
@@ -241,31 +362,72 @@ export class MediasoupRoom {
    * a second kick on the same pubkey is a no-op.
    */
   async kick(targetPubkey: Hex, reason?: string): Promise<void> {
-    const peer = this.peers.get(targetPubkey);
-    if (!peer) return;
-    log.info('kick', { target: targetPubkey.slice(0, 8), reason: reason ?? '' });
-    // Remove from the peer table BEFORE closing so the transport-close
-    // observer's `peers.get(pubkey) === peer` guard short-circuits and we
-    // don't double-publish `peerLeft` from both this method and the
-    // observer.
-    this.peers.delete(targetPubkey);
-    try { peer.sendTransport?.close(); } catch { /* ignore */ }
-    try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    // Kick by pubkey covers ALL devices of that user — admin moderation
+    // shouldn't leave one of someone's devices in the room while booting
+    // the other. Snapshot to a list because we mutate `peers` mid-loop.
+    const targets: PeerState[] = [];
+    for (const peer of this.peers.values()) {
+      if (peer.pubkey === targetPubkey) targets.push(peer);
+    }
+    if (targets.length === 0) return;
+    log.info('kick', { target: targetPubkey.slice(0, 8), reason: reason ?? '', devices: targets.length });
+    for (const peer of targets) {
+      // Remove from the peer table BEFORE closing so the transport-close
+      // observer's `peers.get(key) === peer` guard short-circuits and we
+      // don't double-publish `peerLeft` from both this method and the
+      // observer.
+      this.peers.delete(peerKey(peer.pubkey, peer.clientId));
+      for (const producerId of peer.producers.keys()) {
+        for (const other of this.peers.values()) {
+          if (!other.recvTransport) continue;
+          void this.sendNotification(other.pubkey, 'producerClosed', { producerId });
+        }
+      }
+      try { peer.sendTransport?.close(); } catch { /* ignore */ }
+      try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    }
     await this.sendNotification(targetPubkey, 'kicked', { reason: reason ?? null });
     this.fanoutPeerLeft(targetPubkey);
   }
 
   /**
    * Centralized "this peer is gone from the room" handler. Removes them
-   * from `this.peers` and fans out `peerLeft` to everyone else with a recv
-   * transport. Called from the transport-close observer (organic
-   * disconnect) and from `kick` (admin action, after the peer is already
-   * removed — second call is a no-op thanks to the .get() guard).
+   * from `this.peers`, fires `producerClosed` for each producer they
+   * owned, then fans out `peerLeft` to everyone else with a recv
+   * transport. Notification order matters: clients drop tracks on
+   * `producerClosed` and only treat `peerLeft` as a roster update.
+   * Without the per-producer fanout, abrupt disconnects (tab close,
+   * network loss, OS sleep) leave black tiles in the dex until the
+   * jitter buffer drains. Called from the transport-close observer
+   * (organic disconnect) and from `kick` (admin action, after the peer
+   * is already removed — second call is a no-op thanks to the .get()
+   * guard above).
    */
-  private handlePeerLeft(pubkey: Hex): void {
-    if (!this.peers.delete(pubkey)) return;
-    log.info('peer left', { peer: pubkey.slice(0, 8) });
-    this.fanoutPeerLeft(pubkey);
+  private handlePeerLeft(peer: PeerState): void {
+    if (!this.peers.delete(peerKey(peer.pubkey, peer.clientId))) return;
+    log.info('peer left', { peer: peer.pubkey.slice(0, 8), producers: peer.producers.size });
+    // 1. Fan out producerClosed for every producer this peer owned, so
+    //    every other peer's recvTransport-bound consumers know to drop
+    //    the corresponding track immediately. Don't rely on mediasoup's
+    //    own producerclose event because the transport close that
+    //    triggered us is already racing — we want the wire notification
+    //    out before the consumer-side close is observed.
+    for (const producerId of peer.producers.keys()) {
+      for (const other of this.peers.values()) {
+        if (!other.recvTransport) continue;
+        void this.sendNotification(other.pubkey, 'producerClosed', { producerId });
+      }
+    }
+    // 2. Then peerLeft for the roster update — but only if the user has
+    // no other devices still in the room. Without this check, dropping
+    // device 1 of a multi-device user would tell every other peer the
+    // user left, even though device 2 is still producing media.
+    const userStillPresent = Array.from(this.peers.values()).some(
+      (p) => p.pubkey === peer.pubkey,
+    );
+    if (!userStillPresent) {
+      this.fanoutPeerLeft(peer.pubkey);
+    }
   }
 
   private fanoutPeerLeft(pubkey: Hex): void {
@@ -281,7 +443,10 @@ export class MediasoupRoom {
       status: this._status,
       hostPubkey: this.hostPubkey,
       rules: this._rules,
-      participants: Array.from(this.peers.keys()),
+      // De-duplicate by pubkey: the snapshot is consumed by HTTP /rooms
+      // and admin tooling that thinks of "participants" as users, not
+      // devices. Users with two devices in the same room appear once.
+      participants: Array.from(new Set(Array.from(this.peers.values()).map((p) => p.pubkey))),
       startedAt: this.startedAt,
     };
   }
@@ -327,6 +492,11 @@ export class MediasoupRoom {
     this.activeCallTimer = setInterval(() => {
       void this.publishActiveCall().catch(() => undefined);
     }, ACTIVE_CALL_INTERVAL_MS);
+    this.reaperTimer = setInterval(() => {
+      void this.reap().catch((err) =>
+        log.warn('reaper threw', { err: (err as Error).message }),
+      );
+    }, REAPER_INTERVAL_MS);
 
     log.info('room started', {
       channelId: this.channelId.slice(0, 8),
@@ -341,6 +511,13 @@ export class MediasoupRoom {
 
     if (this.beaconTimer) { clearInterval(this.beaconTimer); this.beaconTimer = null; }
     if (this.activeCallTimer) { clearInterval(this.activeCallTimer); this.activeCallTimer = null; }
+    if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    // Clear any per-peer ICE/DTLS sweep timers so a slow shutdown doesn't
+    // leave them firing into a closed Room.
+    for (const peer of this.peers.values()) {
+      for (const t of peer.unhealthyTimers.values()) clearTimeout(t);
+      peer.unhealthyTimers.clear();
+    }
     this.signalUnsub?.();
     this.signalUnsub = null;
 
@@ -385,23 +562,34 @@ export class MediasoupRoom {
       requestId: envelope.requestId.slice(0, 8),
     });
 
-    const decision = canDialRoom({
-      rules: this._rules,
-      members: this.membership.getMembers(this.channelId),
-      hostPubkey: this.hostPubkey,
-      sender: fromPubkey,
-    });
-    if (!decision.ok) {
-      log.debug('rpc refused at door', {
-        from: fromPubkey.slice(0, 8),
-        reason: decision.reason,
+    // `leave` bypasses the dial gate — a kicked or denied peer must
+    // still be able to gracefully tear down their transports server-side
+    // (otherwise their "you're already in this call" rejection persists
+    // until ICE/DTLS times out, which is the symptom in bug #6).
+    if (envelope.method !== 'leave') {
+      const decision = canDialRoom({
+        rules: this._rules,
+        members: this.membership.getMembers(this.channelId),
+        hostPubkey: this.hostPubkey,
+        sender: fromPubkey,
       });
-      return;
+      if (!decision.ok) {
+        log.debug('rpc refused at door', {
+          from: fromPubkey.slice(0, 8),
+          reason: decision.reason,
+        });
+        return;
+      }
     }
 
+    // `clientId` distinguishes two devices belonging to the same Nostr
+    // pubkey. Legacy clients (pre-multi-device) don't send it; they
+    // collapse onto a single peer slot keyed by `'_legacy'` per pubkey.
+    const clientId = envelope.clientId ?? '_legacy';
     const ctx: RpcContext = {
       channelId: this.channelId,
       fromPubkey,
+      clientId,
       notify: (method, data) => this.sendNotification(fromPubkey, method, data),
     };
     const response = await dispatchRequest(this.handlers, ctx, envelope);
@@ -415,7 +603,18 @@ export class MediasoupRoom {
       tags: [
         ['p', toPubkey],
         ['e', this.channelId],
+        // Both tags are present:
+        //  - `obelisk-voice-signal` keeps the wire shape uniform with mesh
+        //    peer signals (legacy dex clients that subscribe on this tag
+        //    keep receiving responses).
+        //  - `obelisk-sfu-rpc` is the distinguishing marker so newer dex
+        //    versions can filter at subscription time (e.g.
+        //    `#t: ['obelisk-voice-signal']` for peer SDP only,
+        //    `#t: ['obelisk-sfu-rpc']` for SFU RPC only) instead of
+        //    receiving every RPC envelope destined for every peer in
+        //    the room and dropping them in-handler.
         ['t', 'obelisk-voice-signal'],
+        ['t', 'obelisk-sfu-rpc'],
       ],
       created_at: Math.floor(Date.now() / 1000),
     });
@@ -436,6 +635,7 @@ export class MediasoupRoom {
         ['p', toPubkey],
         ['e', this.channelId],
         ['t', 'obelisk-voice-signal'],
+        ['t', 'obelisk-sfu-rpc'],
       ],
       created_at: Math.floor(Date.now() / 1000),
     });
@@ -443,20 +643,34 @@ export class MediasoupRoom {
 
   // ── method handlers ────────────────────────────────────────────────────
 
-  private getOrCreatePeer(pubkey: Hex): PeerState {
-    let p = this.peers.get(pubkey);
+  private getOrCreatePeer(pubkey: Hex, clientId: string): PeerState {
+    const key = peerKey(pubkey, clientId);
+    let p = this.peers.get(key);
     if (!p) {
       const cap = this._rules.maxParticipants ?? this.cfg.maxParticipantsPerRoom;
-      if (this.peers.size >= cap) {
+      // Cap counts by unique pubkey, not unique device — a user with
+      // both a phone and a desktop connected only consumes one of the
+      // operator's "max participants" slots. Otherwise the second
+      // device's join would silently fail with ROOM_FULL on a busy
+      // call right at the cap.
+      const distinctPubkeys = new Set<Hex>();
+      for (const peer of this.peers.values()) distinctPubkeys.add(peer.pubkey);
+      if (!distinctPubkeys.has(pubkey) && distinctPubkeys.size >= cap) {
         throw new RpcError('room full', 'ROOM_FULL');
       }
+      const now = Date.now();
       p = {
         pubkey,
+        clientId,
         producers: new Map(),
         consumers: new Map(),
         producerAppData: new Map(),
+        unhealthyTimers: new Map(),
+        lastInboundPacketAt: now,
+        lastSeenPacketCount: 0,
+        joinedAt: now,
       };
-      this.peers.set(pubkey, p);
+      this.peers.set(key, p);
     }
     return p;
   }
@@ -475,7 +689,7 @@ export class MediasoupRoom {
       if (!this.router) throw new RpcError('router not ready', 'NO_ROUTER');
       const data = (raw ?? {}) as { direction?: 'send' | 'recv' };
       const direction = data.direction === 'recv' ? 'recv' : 'send';
-      const peer = this.getOrCreatePeer(ctx.fromPubkey);
+      const peer = this.getOrCreatePeer(ctx.fromPubkey, ctx.clientId);
       const existing = direction === 'send' ? peer.sendTransport : peer.recvTransport;
       // On browser reload the dex re-issues createWebRtcTransport for the same
       // peer. Idempotently returning the old transport leaves the browser
@@ -502,11 +716,52 @@ export class MediasoupRoom {
       const transport = await this.router.createWebRtcTransport(
         this.engine.webRtcTransportOptions(),
       );
+      // Bug #6 — drop the peer when ICE or DTLS stays bad for >15 s.
+      // ICE/DTLS state can flap during normal wifi handoff; the timer
+      // arms on a bad transition and disarms on a recovery, so a brief
+      // blip doesn't trigger a reap.
+      const armUnhealthyTimer = (cause: string): void => {
+        if (peer.unhealthyTimers.has(transport.id)) return; // already armed
+        const t = setTimeout(() => {
+          peer.unhealthyTimers.delete(transport.id);
+          // Recheck — observer may have already swapped the peer out.
+          if (this.peers.get(peerKey(peer.pubkey, peer.clientId)) !== peer) return;
+          log.info('peer unhealthy timeout — dropping', {
+            peer: peer.pubkey.slice(0, 8),
+            direction,
+            id: transport.id,
+            cause,
+          });
+          this.dropStalePeer(peer, `unhealthy:${cause}`);
+        }, TRANSPORT_UNHEALTHY_TIMEOUT_MS);
+        peer.unhealthyTimers.set(transport.id, t);
+      };
+      const cancelUnhealthyTimer = (): void => {
+        const t = peer.unhealthyTimers.get(transport.id);
+        if (t) {
+          clearTimeout(t);
+          peer.unhealthyTimers.delete(transport.id);
+        }
+      };
+      transport.on('icestatechange', (state) => {
+        // mediasoup's IceState is: new | connected | completed | disconnected | closed.
+        // No 'failed' here (DTLS reports that separately below).
+        if (state === 'disconnected') {
+          armUnhealthyTimer('ice=disconnected');
+        } else if (state === 'connected' || state === 'completed') {
+          cancelUnhealthyTimer();
+        }
+      });
       transport.on('dtlsstatechange', (state) => {
-        if (state === 'closed') {
+        if (state === 'failed') {
+          armUnhealthyTimer('dtls=failed');
+        } else if (state === 'connected') {
+          cancelUnhealthyTimer();
+        } else if (state === 'closed') {
           log.debug('transport dtls closed', {
             peer: ctx.fromPubkey.slice(0, 8), direction, id: transport.id,
           });
+          cancelUnhealthyTimer();
         }
       });
       // When BOTH transports of a peer have closed organically (DTLS death,
@@ -520,8 +775,8 @@ export class MediasoupRoom {
         if (!isStillSend && !isStillRecv) return; // already swapped out
         if (isStillSend) delete peer.sendTransport;
         if (isStillRecv) delete peer.recvTransport;
-        if (!peer.sendTransport && !peer.recvTransport && this.peers.get(peer.pubkey) === peer) {
-          this.handlePeerLeft(peer.pubkey);
+        if (!peer.sendTransport && !peer.recvTransport && this.peers.get(peerKey(peer.pubkey, peer.clientId)) === peer) {
+          this.handlePeerLeft(peer);
         }
       });
       if (direction === 'send') peer.sendTransport = transport;
@@ -540,11 +795,17 @@ export class MediasoupRoom {
       // perspective of every browser-side user, and the dex needs them
       // in the roster to render their tile.
       if (direction === 'recv') {
-        const otherPubkeys: Hex[] = [];
-        for (const other of this.peers.values()) {
-          if (other.pubkey === ctx.fromPubkey) continue;
-          otherPubkeys.push(other.pubkey);
-        }
+        // Dedupe by pubkey: a user with two devices in the room is one
+        // participant from every other peer's perspective. The snapshot
+        // already dedupes; mirror that here for the participantList push
+        // so the new arrival's roster matches what existing peers see.
+        const otherPubkeys = Array.from(
+          new Set(
+            Array.from(this.peers.values())
+              .filter((p) => p.pubkey !== ctx.fromPubkey)
+              .map((p) => p.pubkey),
+          ),
+        );
         void ctx.notify('participantList', { pubkeys: otherPubkeys });
 
         for (const other of this.peers.values()) {
@@ -559,12 +820,22 @@ export class MediasoupRoom {
           }
         }
 
-        for (const other of this.peers.values()) {
-          if (other.pubkey === ctx.fromPubkey) continue;
-          if (!other.recvTransport) continue;
-          void this.sendNotification(other.pubkey, 'peerJoined', {
-            pubkey: ctx.fromPubkey,
-          });
+        // peerJoined is a roster-add signal. Suppress it when the same
+        // user is already in the room via another device — otherwise
+        // existing peers see "user A joined" for an A who never left.
+        // sameUserCount counts THIS peer too, so >1 means another
+        // device already represented user A.
+        const sameUserCount = Array.from(this.peers.values()).filter(
+          (p) => p.pubkey === ctx.fromPubkey,
+        ).length;
+        if (sameUserCount <= 1) {
+          for (const other of this.peers.values()) {
+            if (other.pubkey === ctx.fromPubkey) continue;
+            if (!other.recvTransport) continue;
+            void this.sendNotification(other.pubkey, 'peerJoined', {
+              pubkey: ctx.fromPubkey,
+            });
+          }
         }
       }
 
@@ -578,7 +849,7 @@ export class MediasoupRoom {
 
     connectWebRtcTransport: async (ctx, raw) => {
       const data = raw as { transportId: string; dtlsParameters: ms.DtlsParameters };
-      const peer = this.peers.get(ctx.fromPubkey);
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
       if (!peer) throw new RpcError('no peer state', 'NO_PEER');
       const transport = peer.sendTransport?.id === data.transportId
         ? peer.sendTransport
@@ -597,7 +868,7 @@ export class MediasoupRoom {
         rtpParameters: ms.RtpParameters;
         appData?: { kind?: 'audio' | 'camera' | 'screen' | 'screen-audio' };
       };
-      const peer = this.peers.get(ctx.fromPubkey);
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
       if (!peer) throw new RpcError('no peer state', 'NO_PEER');
       const transport = peer.sendTransport;
       if (!transport || transport.id !== data.transportId) {
@@ -607,8 +878,7 @@ export class MediasoupRoom {
         kind: data.kind,
         rtpParameters: data.rtpParameters,
       });
-      const voiceKind = data.appData?.kind
-        ?? (data.kind === 'audio' ? 'audio' : 'camera');
+      const voiceKind = sanitizeVoiceKind(data.appData?.kind, data.kind);
       peer.producers.set(producer.id, producer);
       peer.producerAppData.set(producer.id, {
         kind: voiceKind,
@@ -642,7 +912,7 @@ export class MediasoupRoom {
 
     consume: async (ctx, raw) => {
       const data = raw as { producerId: string; rtpCapabilities: ms.RtpCapabilities };
-      const peer = this.peers.get(ctx.fromPubkey);
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
       if (!peer) throw new RpcError('no peer state', 'NO_PEER');
       if (!peer.recvTransport) throw new RpcError('recv transport not ready', 'NO_RECV_TRANSPORT');
       if (!this.router) throw new RpcError('no router', 'NO_ROUTER');
@@ -664,8 +934,29 @@ export class MediasoupRoom {
         paused: true,
       });
       peer.consumers.set(data.producerId, consumer);
-      consumer.on('transportclose', () => peer.consumers.delete(data.producerId));
+      // Keyframe heartbeat: video freezes silently on packet loss when
+      // the producer's natural keyframe interval is long (mediasoup
+      // defaults to ~one every 5–10s under load, but real-world I-frame
+      // gaps can stretch to 30s+ over flaky links). Browser-side
+      // mediasoup-client only requests keyframes on detected loss; if a
+      // bunch of packets drop and the consumer's PLI never reaches the
+      // producer (e.g., Wi-Fi roam), the receiver stays frozen on the
+      // last-good frame until the producer next emits I. Force one every
+      // 8s so the worst-case freeze is ~8s, not 30+s.
+      let keyframeTimer: ReturnType<typeof setInterval> | null = null;
+      if (consumer.kind === 'video') {
+        keyframeTimer = setInterval(() => {
+          if (consumer.closed || consumer.paused) return;
+          consumer.requestKeyFrame()
+            .catch((err) => log.debug('keyframe heartbeat failed', { err: (err as Error).message }));
+        }, 8000);
+      }
+      consumer.on('transportclose', () => {
+        if (keyframeTimer) { clearInterval(keyframeTimer); keyframeTimer = null; }
+        peer.consumers.delete(data.producerId);
+      });
       consumer.on('producerclose', () => {
+        if (keyframeTimer) { clearInterval(keyframeTimer); keyframeTimer = null; }
         peer.consumers.delete(data.producerId);
         void this.sendNotification(peer.pubkey, 'producerClosed', { producerId: data.producerId });
       });
@@ -680,11 +971,22 @@ export class MediasoupRoom {
 
     resumeConsumer: async (ctx, raw) => {
       const data = raw as { consumerId: string };
-      const peer = this.peers.get(ctx.fromPubkey);
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
       if (!peer) throw new RpcError('no peer state', 'NO_PEER');
       for (const consumer of peer.consumers.values()) {
         if (consumer.id === data.consumerId) {
           await consumer.resume();
+          // Ask the producer to emit a fresh keyframe so the consumer
+          // renders the next P-frame correctly. Video consumers attach
+          // mid-stream (the producer sends a keyframe every ~60s
+          // by default), so without an explicit request the receiver
+          // sees a black/frozen tile until that interval elapses.
+          // Audio consumers don't have keyframes — `requestKeyFrame()`
+          // is a no-op there, so we fire it unconditionally.
+          if (consumer.kind === 'video') {
+            try { await consumer.requestKeyFrame(); }
+            catch (err) { log.debug('requestKeyFrame on resume failed', { err: (err as Error).message }); }
+          }
           return {};
         }
       }
@@ -693,7 +995,7 @@ export class MediasoupRoom {
 
     closeProducer: async (ctx, raw) => {
       const data = raw as { producerId: string };
-      const peer = this.peers.get(ctx.fromPubkey);
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
       if (!peer) throw new RpcError('no peer state', 'NO_PEER');
       const producer = peer.producers.get(data.producerId);
       if (!producer) throw new RpcError('unknown producer', 'NO_PRODUCER');
@@ -705,7 +1007,115 @@ export class MediasoupRoom {
       // needing to fan it out manually here.
       return {};
     },
+
+    /**
+     * Bug #6 — explicit graceful leave RPC. Idempotent: a `leave` for an
+     * already-gone peer just returns ok. Without this the SFU relies
+     * entirely on DTLS close-notify to clean up, which is unreliable on
+     * abrupt tab close / network loss / quick rejoin and leaves the
+     * peer "stuck in the room" until ICE/DTLS times out (often 30 s+).
+     * The dex's `pagehide`/`beforeunload` handler fire-and-forgets a
+     * `leave` request before tearing down, so even an abrupt close
+     * gets a clean slot release in most cases.
+     */
+    leave: async (ctx) => {
+      const peer = this.peers.get(peerKey(ctx.fromPubkey, ctx.clientId));
+      if (!peer) {
+        log.debug('leave: peer already gone', { peer: ctx.fromPubkey.slice(0, 8) });
+        return { ok: true };
+      }
+      log.info('leave RPC', { peer: ctx.fromPubkey.slice(0, 8) });
+      this.dropStalePeer(peer, 'leave-rpc');
+      return { ok: true };
+    },
   };
+
+  /**
+   * Centralized teardown for "this peer is gone, full cleanup": fire
+   * `producerClosed` per-producer, `peerLeft` to the rest of the room,
+   * close transports (mediasoup propagates the close to producers +
+   * consumers automatically), clear sweep timers. Used by `leave` RPC,
+   * the ICE/DTLS sweep, and the activity reaper. Idempotent at the
+   * peer-table level — second call is a no-op.
+   */
+  private dropStalePeer(peer: PeerState, cause: string): void {
+    if (this.peers.get(peerKey(peer.pubkey, peer.clientId)) !== peer) return;
+    log.info('drop stale peer', { peer: peer.pubkey.slice(0, 8), cause });
+    // Cancel sweep timers BEFORE removing from peers map so the timer
+    // callback's pubkey-equality guard fails fast if it fires concurrently.
+    for (const t of peer.unhealthyTimers.values()) clearTimeout(t);
+    peer.unhealthyTimers.clear();
+    // Remove from table BEFORE closing transports so the close observer's
+    // `this.peers.get(peerKey(peer.pubkey, peer.clientId)) === peer` check short-circuits and we
+    // don't double-fire the peerLeft fanout.
+    this.peers.delete(peer.pubkey);
+    // Fire producerClosed before peerLeft per bug #1 ordering rule.
+    for (const producerId of peer.producers.keys()) {
+      for (const other of this.peers.values()) {
+        if (!other.recvTransport) continue;
+        void this.sendNotification(other.pubkey, 'producerClosed', { producerId });
+      }
+    }
+    this.fanoutPeerLeft(peer.pubkey);
+    try { peer.sendTransport?.close(); } catch { /* ignore */ }
+    try { peer.recvTransport?.close(); } catch { /* ignore */ }
+  }
+
+  /**
+   * Activity-based reaper (bug #7). Runs every `REAPER_INTERVAL_MS`.
+   * Drops peers whose RTP packet count hasn't moved for
+   * `RTP_INACTIVITY_TIMEOUT_MS`, and peers that joined but never
+   * published anything for `NO_PRODUCER_TIMEOUT_MS`. RTP flow is the
+   * only signal that survives soft failures (laptop closed but radio
+   * on, mobile background-throttle, OS suspend) — ICE/DTLS can read
+   * "healthy" while no actual media is moving.
+   */
+  private async reap(): Promise<void> {
+    if (this._status !== 'active') return;
+    const now = Date.now();
+    // Snapshot to a list — `dropStalePeer` mutates `this.peers`, which
+    // we don't want to iterate over directly while doing so.
+    const peers = Array.from(this.peers.values());
+    for (const peer of peers) {
+      // Re-check — earlier reap iteration may have dropped this peer
+      // (e.g. via cascading close events).
+      if (this.peers.get(peerKey(peer.pubkey, peer.clientId)) !== peer) continue;
+
+      if (peer.producers.size === 0) {
+        if (now - peer.joinedAt > NO_PRODUCER_TIMEOUT_MS) {
+          this.dropStalePeer(peer, 'no-producers-timeout');
+        }
+        continue;
+      }
+
+      let totalPackets = 0;
+      let any = false;
+      for (const producer of peer.producers.values()) {
+        try {
+          const stats = await producer.getStats();
+          for (const stat of stats) {
+            // mediasoup ProducerStat shape is union-typed across audio /
+            // video / RTX layers — `packetCount` is on the inbound entries.
+            const pc = (stat as { packetCount?: number }).packetCount;
+            if (typeof pc === 'number') {
+              totalPackets += pc;
+              any = true;
+            }
+          }
+        } catch {
+          // producer closed mid-iteration — fine, will be reaped next pass
+          // if the peer is genuinely gone, or skipped this pass.
+        }
+      }
+      if (!any) continue;
+      if (totalPackets > peer.lastSeenPacketCount) {
+        peer.lastSeenPacketCount = totalPackets;
+        peer.lastInboundPacketAt = now;
+      } else if (now - peer.lastInboundPacketAt > RTP_INACTIVITY_TIMEOUT_MS) {
+        this.dropStalePeer(peer, 'rtp-inactivity');
+      }
+    }
+  }
 
   // ── periodic publishers ────────────────────────────────────────────────
 

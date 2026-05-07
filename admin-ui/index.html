@@ -107,6 +107,10 @@
       <input type="checkbox" id="i-allowAll" />
       <label for="i-allowAll" style="margin:0">Allow all (testing only — bypasses allow-list)</label>
     </div>
+    <div class="field row">
+      <input type="checkbox" id="i-requireAllowedPubkey" />
+      <label for="i-requireAllowedPubkey" style="margin:0">Strict allow-list: require sender on allow-list even when event came from a trusted-author relay</label>
+    </div>
     <div class="field">
       <label>Public URL (advertised in kind 31313)</label>
       <input type="text" id="i-publicUrl" />
@@ -130,6 +134,27 @@
   <section id="rooms-card" class="card" style="display:none">
     <h2>Active rooms</h2>
     <div id="rooms-list"></div>
+  </section>
+
+  <section id="test-peers-card" class="card" style="display:none">
+    <h2>Test peers</h2>
+    <p class="muted">Spawn synthetic ffmpeg-driven mediasoup producers in an active room to smoke-test forwarding without two real browsers. Each spawn gets a fresh ephemeral identity.</p>
+    <div class="field">
+      <label>Channel id (hex, 8–64 chars)</label>
+      <input type="text" id="i-test-channel" placeholder="abc123…"/>
+    </div>
+    <div class="field">
+      <label>Relays (one per line) — defaults to the SFU's configured relays</label>
+      <textarea id="i-test-relays" rows="2" placeholder="wss://relay.obelisk.ar"></textarea>
+      <p class="muted mono" style="font-size:11px;margin:6px 0 0">
+        The test peer publishes its kind 25052 <span class="mono">start</span> + kind 20078 beacon to these relays. The peer's pubkey must be whitelisted on the trusted-author relay (or be on this SFU's allow-list) for the start to be accepted.
+      </p>
+    </div>
+    <div class="row">
+      <button id="spawn-test-peer-btn" class="pill pill-primary">Spawn test peer</button>
+      <button id="refresh-test-peers-btn" class="pill">Refresh</button>
+    </div>
+    <div id="test-peers-list" style="margin-top:14px"></div>
   </section>
 </main>
 
@@ -201,6 +226,11 @@
       $('state-card').style.display = '';
       $('settings-card').style.display = '';
       $('rooms-card').style.display = '';
+      // Test peers card only when the SFU is on mediasoup; werift can't
+      // service the inject path the script uses.
+      if (snapshot && snapshot.engine === 'mediasoup') {
+        $('test-peers-card').style.display = '';
+      }
       $('auth-state').innerHTML = `<span class="badge live">●</span> <span class="mono">${nip19.npubEncode(myPubkey)}</span>`;
     } catch (err) {
       $('login-err').textContent = err.message;
@@ -223,8 +253,14 @@
 
     $('i-relays').value = s.relays.join('\n');
     $('i-trusted').value = s.trustedAuthorRelays.join('\n');
+    // Test-peer relay textarea: only prefill the placeholder hint so the
+    // operator sees what the default would be without it being treated as
+    // an override. Real default lives server-side in TestPeerSpawner.spawn.
+    const trel = $('i-test-relays');
+    if (trel) trel.placeholder = s.relays.join('\n') || 'wss://relay.example';
     $('i-allowed').value = s.allowed.join('\n');
     $('i-allowAll').checked = !!s.allowAll;
+    $('i-requireAllowedPubkey').checked = !!s.requireAllowedPubkey;
     $('i-publicUrl').value = s.publicUrl || '';
     $('i-region').value = s.region || '';
     $('i-operator').value = s.operator || '';
@@ -239,6 +275,7 @@
             <span class="mono">${r.channelId.slice(0, 16)}…</span>
             · <span class="badge live">${r.status}</span>
             · ${r.participants} participants
+            <button class="pill" data-prefill-channel="${r.channelId}" style="margin-left:8px;font-size:11px;padding:4px 10px">Use as test target</button>
           </summary>
           <div class="kv" style="margin-top:8px">
             <div>Host</div><div class="mono">${r.host || '—'}</div>
@@ -246,6 +283,79 @@
           </div>
         </details>
       `).join('');
+
+      // Wire "Use as test target" buttons — copies channel id into the
+      // test-peer spawn input so the operator doesn't have to retype the
+      // 16-byte hex.
+      list.querySelectorAll('button[data-prefill-channel]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const cid = btn.getAttribute('data-prefill-channel');
+          if (!cid) return;
+          $('i-test-channel').value = cid;
+          $('test-peers-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+      });
+    }
+
+    renderTestPeers(s.testPeers);
+  }
+
+  function renderTestPeers(peers) {
+    const list = $('test-peers-list');
+    if (!list) return;
+    if (!peers || peers.length === 0) {
+      list.innerHTML = '<p class="muted">No test peers running.</p>';
+      return;
+    }
+    list.innerHTML = peers.map((p) => `
+      <details>
+        <summary>
+          <span class="mono">${p.peerId}</span>
+          · channel <span class="mono">${p.channelId.slice(0, 12)}…</span>
+          · pid ${p.pid ?? '—'}
+          <button class="pill pill-danger" data-stop-peer="${p.peerId}" style="margin-left:8px;font-size:11px;padding:4px 10px">Stop</button>
+        </summary>
+        <div class="kv" style="margin-top:8px">
+          <div>Pubkey</div><div class="mono">${p.pubkey}</div>
+          <div>Started</div><div class="mono">${new Date(p.startedAt * 1000).toISOString()}</div>
+          <div>Relays</div><div class="mono">${(p.relays || []).join('<br>') || '—'}</div>
+        </div>
+      </details>
+    `).join('');
+
+    list.querySelectorAll('button[data-stop-peer]').forEach((btn) => {
+      btn.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        const peerId = btn.getAttribute('data-stop-peer');
+        if (!peerId) return;
+        try {
+          await api('/admin/test-peer/stop', 'POST', { peerId });
+          toast('Test peer stopped', 'ok');
+          await refresh();
+        } catch (err) {
+          toast(err.message, 'err');
+        }
+      });
+    });
+  }
+
+  async function spawnTestPeer() {
+    const channelId = $('i-test-channel').value.trim().toLowerCase();
+    if (!/^[0-9a-f]{8,64}$/.test(channelId)) {
+      toast('Channel id must be hex (8–64 chars)', 'err');
+      return;
+    }
+    // Per-spawn relay override: empty textarea → server uses its own
+    // configured relays. Non-empty → send the user's list.
+    const relayLines = parseLines($('i-test-relays').value);
+    const body = relayLines.length > 0 ? { channelId, relays: relayLines } : { channelId };
+    try {
+      const info = await api('/admin/test-peer/spawn', 'POST', body);
+      toast(`Spawned ${info.peerId}`, 'ok');
+      await refresh();
+    } catch (err) {
+      toast(err.message, 'err');
     }
   }
 
@@ -260,6 +370,7 @@
       trustedAuthorRelays: parseLines($('i-trusted').value),
       allowed: parseLines($('i-allowed').value),
       allowAll: $('i-allowAll').checked,
+      requireAllowedPubkey: $('i-requireAllowedPubkey').checked,
       publicUrl: $('i-publicUrl').value.trim() || null,
       region: $('i-region').value.trim() || null,
       operatorPubkey: $('i-operator').value.trim().toLowerCase() || null,
@@ -288,6 +399,8 @@
   $('save-btn').addEventListener('click', save);
   $('restart-btn').addEventListener('click', restart);
   $('refresh-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));
+  $('spawn-test-peer-btn').addEventListener('click', spawnTestPeer);
+  $('refresh-test-peers-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));
 
   // Auto-attempt login if NIP-07 is available — most operators have it.
   if (typeof window.nostr === 'object' && window.nostr) {

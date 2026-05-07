@@ -16,6 +16,7 @@
     "start": "node --enable-source-maps dist/index.js",
     "dev": "tsx watch src/index.ts",
     "raise": "./scripts/sfu-raise.sh",
+    "deploy": "./scripts/sfu-deploy.sh",
     "setup": "./scripts/setup.sh",
     "generate-keys": "node scripts/generate-keys.mjs",
     "typecheck": "tsc --noEmit"

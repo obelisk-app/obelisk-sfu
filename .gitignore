@@ -8,3 +8,8 @@ runtime.json
 
 # Root .gitignore has `.env*` which would otherwise hide our committed example.
 !.env.example
+
+# Test-peer state (persistent identity, pid lockfiles).
+scripts/.test-peer/
+scripts/.test-peer-ms/
+scripts/.test-peer-mesh/

@@ -10,6 +10,8 @@
  *   - the allow-list reloads (SIGHUP)
  *   - every REFRESH_INTERVAL_MS as a heartbeat (in case the relay forgot)
  */
+import { randomBytes } from 'node:crypto';
+
 import type { Config } from './config.js';
 import { KIND_SFU_ADVERTISEMENT } from './nip-kinds.js';
 import { createLogger } from './log.js';
@@ -21,6 +23,16 @@ const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 export class Advertiser {
   private timer: NodeJS.Timeout | null = null;
+  /**
+   * Per-process session id. Re-rolled on every boot so clients comparing
+   * the advertised value to a cached one can detect "the SFU restarted,
+   * drop all in-flight transport state and rejoin." Without this, clients
+   * keep their WebRTC transports open after a restart while the SFU has
+   * no record of them — the dex's only signal today is the absence of
+   * the kind 20078 beacon, which races a watchdog timeout. See bug #5.
+   */
+  private readonly sessionId: string = randomBytes(8).toString('hex');
+  private readonly bootedAt: number = Math.floor(Date.now() / 1000);
 
   constructor(
     private readonly cfg: Config,
@@ -95,6 +107,13 @@ export class Advertiser {
       ['cap', String(this.cfg.maxParticipantsPerRoom)],
       ['max_rooms', String(this.cfg.maxRooms)],
       ['version', '1'],
+      // Session id changes on every restart. Clients cache the value
+      // alongside their transport state; if they observe a different
+      // value on the next advertisement, the SFU has been restarted
+      // and any in-memory peer/transport assumptions are stale —
+      // drop them and rejoin.
+      ['session', this.sessionId],
+      ['booted_at', String(this.bootedAt)],
     ];
 
     if (this.cfg.publicUrl) tags.push(['url', this.cfg.publicUrl]);

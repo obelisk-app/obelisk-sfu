@@ -160,16 +160,28 @@ export class CallListener {
     payload: SfuControlPayload,
     fromTrustedRelay: boolean,
   ): Promise<void> {
-    // The trusted-relay path is the production-grade gate: anyone whose
-    // event made it to a trusted-author relay's subscription is by
-    // construction authorized (the relay's whitelist gated the publish).
-    // The local allow.json + operator key remain as the manual override.
-    const authorized =
-      fromTrustedRelay
-      || isAllowedToStart(this.cfg, this.relay.pubkey, sender);
+    // Two-layer auth.
+    //
+    // Default (back-compat): trusted-relay event-source is enough — the
+    // relay's write-whitelist already proved the sender is authorized.
+    // The local allow.json / SFU_ALLOWED_PUBKEYS is the manual fallback.
+    //
+    // requireAllowedPubkey=1: every `start` MUST also pass the local
+    // allow-list (or be the operator). Use this when you don't fully
+    // trust the relay's ACL — e.g., a relay whose write rules accidentally
+    // went open authorizes the world unless this flag is set. Multiple
+    // operators sharing one SFU also want this on so per-channel control
+    // stays meaningful.
+    const passesAllowList = isAllowedToStart(this.cfg, this.relay.pubkey, sender);
+    const authorized = this.cfg.requireAllowedPubkey
+      ? passesAllowList
+      : fromTrustedRelay || passesAllowList;
     if (!authorized) {
-      log.warn('start rejected: sender not authorized (no allow-list / not on trusted relay)', {
+      log.warn('start rejected: sender not authorized', {
         sender: sender.slice(0, 8),
+        viaTrustedRelay: fromTrustedRelay,
+        passesAllowList,
+        strict: this.cfg.requireAllowedPubkey,
       });
       return;
     }

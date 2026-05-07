@@ -32,6 +32,7 @@ export interface RuntimeOverrides {
   trustedAuthorRelays?: string[];
   allowed?: string[];
   allowAll?: boolean;
+  requireAllowedPubkey?: boolean;
   publicUrl?: string | null;
   region?: string | null;
   operatorPubkey?: string | null;
@@ -64,6 +65,7 @@ export function applyOverrides(cfg: Config, o: RuntimeOverrides): void {
   if (o.region !== undefined) cfg.region = o.region;
   if (o.operatorPubkey !== undefined) cfg.operatorPubkey = o.operatorPubkey;
   if (typeof o.allowAll === 'boolean') cfg.allowAll = o.allowAll;
+  if (typeof o.requireAllowedPubkey === 'boolean') cfg.requireAllowedPubkey = o.requireAllowedPubkey;
   if (Array.isArray(o.allowed)) {
     cfg.allowedPubkeys.clear();
     for (const pk of o.allowed) {

@@ -21,11 +21,26 @@ const log = createLogger('relay');
 export class RelayPool {
   private readonly pool: SimplePool;
   private closed = false;
+  /**
+   * Relays we both publish AND subscribe on. The SFU has write access
+   * (NIP-42 AUTH-whitelisted) here.
+   */
+  private readonly writeRelays: string[];
+  /**
+   * Read-only relays — subscribed for `start` events and other inbound
+   * traffic, but never published to. Trusted-author relays land here
+   * when the SFU isn't whitelisted on them itself.
+   */
+  private readonly readOnlyRelays: string[];
 
   constructor(
-    private readonly relays: string[],
+    relays: string[],
     private readonly identity: Identity,
+    readOnlyRelays: string[] = [],
   ) {
+    this.writeRelays = [...relays];
+    // De-dupe in case a relay url appears in both lists.
+    this.readOnlyRelays = readOnlyRelays.filter((r) => !this.writeRelays.includes(r));
     // automaticallyAuth: nostr-tools calls this for every relay URL we
     // touch. Returning a signer enables AUTH for that relay; returning
     // null means "skip AUTH for this URL". We sign every challenge — the
@@ -57,7 +72,7 @@ export class RelayPool {
    */
   async publish(template: EventTemplate): Promise<VerifiedEvent> {
     const event = this.identity.sign(template);
-    const results = this.pool.publish(this.relays, event);
+    const results = this.pool.publish(this.writeRelays, event);
 
     let firstAck: string | null = null;
     let firstErr: unknown = null;
@@ -65,13 +80,13 @@ export class RelayPool {
       results.map((p, i) =>
         p
           .then(() => {
-            const relayUrl = this.relays[i];
+            const relayUrl = this.writeRelays[i];
             if (relayUrl && !firstAck) firstAck = relayUrl;
           })
           .catch((err) => {
             if (!firstErr) firstErr = err;
             log.debug('publish relay rejected', {
-              relay: this.relays[i] ?? '(unknown)',
+              relay: this.writeRelays[i] ?? '(unknown)',
               kind: event.kind,
               err: (err as Error)?.message,
             });
@@ -91,6 +106,12 @@ export class RelayPool {
    * Subscribe to a filter across all relays. Returns an `unsub` fn.
    * `subscribeMany` in nostr-tools 2.x takes a SINGLE filter — the
    * handler is called once per unique event id across all relays.
+   *
+   * Subscribes across BOTH writeRelays and readOnlyRelays — that's the
+   * union the SFU advertises (kind 31313 lists `relay` + `trusted_relay`
+   * tags) and clients may publish to either set. Without this fan-in,
+   * a `start` event hitting only a trusted-author relay would be
+   * invisible to anything subscribed via this method.
    */
   subscribe(
     filter: Filter,
@@ -101,12 +122,18 @@ export class RelayPool {
       log.warn('subscribe after close — no-op');
       return () => undefined;
     }
-    const sub = this.pool.subscribeMany(this.relays, filter, {
+    const allRelays = [...this.writeRelays, ...this.readOnlyRelays];
+    const sub = this.pool.subscribeMany(allRelays, filter, {
       onevent: onEvent,
       onauth: this.signAuthChallenge,
       ...(onEose ? { oneose: onEose } : {}),
     });
     return () => sub.close();
+  }
+
+  /** All relays the SFU subscribes on (write + read-only). */
+  get allRelays(): string[] {
+    return [...this.writeRelays, ...this.readOnlyRelays];
   }
 
   /**
@@ -157,7 +184,7 @@ export class RelayPool {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.pool.close(this.relays);
+    this.pool.close([...this.writeRelays, ...this.readOnlyRelays]);
     log.info('relay pool closed');
   }
 }

@@ -24,6 +24,16 @@ export interface RpcRequest<T = unknown> {
   requestId: string;
   method: RpcMethod;
   data?: T;
+  /**
+   * Per-connection id the client mints once at SfuClient construction.
+   * Lets the SFU distinguish two devices belonging to the same Nostr
+   * pubkey — without it, the second device's `createWebRtcTransport`
+   * would reuse the first device's peer slot and close its transports,
+   * kicking the first device. Optional for backwards compatibility:
+   * legacy clients without `clientId` collapse onto a single per-pubkey
+   * peer (pre-multi-device behavior).
+   */
+  clientId?: string;
 }
 
 export interface RpcResponseOk<T = unknown> {
@@ -76,7 +86,10 @@ export function parseEnvelope(content: string): RpcEnvelope | null {
   const type = obj.type;
   if (type === 'request') {
     if (typeof obj.requestId !== 'string' || typeof obj.method !== 'string') return null;
-    return { type: 'request', requestId: obj.requestId, method: obj.method, data: obj.data };
+    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined;
+    return clientId
+      ? { type: 'request', requestId: obj.requestId, method: obj.method, data: obj.data, clientId }
+      : { type: 'request', requestId: obj.requestId, method: obj.method, data: obj.data };
   }
   if (type === 'response') {
     if (typeof obj.requestId !== 'string' || typeof obj.ok !== 'boolean') return null;
@@ -99,6 +112,13 @@ export function parseEnvelope(content: string): RpcEnvelope | null {
 export interface RpcContext {
   channelId: string;
   fromPubkey: Hex;
+  /**
+   * Per-connection id minted by the calling client. When two devices
+   * sign with the same pubkey the SFU uses this to distinguish them
+   * so it doesn't reuse one device's mediasoup transports for the
+   * other. Falls back to `'_legacy'` for clients that don't send it.
+   */
+  clientId: string;
   /** Send a notification back to the originating peer. */
   notify<T>(method: RpcMethod, data?: T): Promise<void>;
 }

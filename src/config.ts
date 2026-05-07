@@ -24,6 +24,16 @@ export interface Config {
   /** Bypass allow-list entirely (SFU_ALLOW_ALL=1). For open testing/dev use. */
   allowAll: boolean;
   /**
+   * If true, reject `start` events whose sender is not in the allow-list
+   * (or the operator), even when the event was published on a trusted-author
+   * relay. Defaults false — current/legacy behavior is "trusted relay
+   * authorizes anyone its write-whitelist accepted." Flip this on when
+   * sharing one SFU across multiple operators, or when you don't fully
+   * trust the relay's own ACL (e.g., a relay whose write rules accidentally
+   * went open). The flag is the belt to the relay's suspenders.
+   */
+  requireAllowedPubkey: boolean;
+  /**
    * Media engine: legacy `werift` (single-process JS, ≤10 receivers per
    * room) or `mediasoup` (C++ worker per CPU core, simulcast, hundreds
    * of receivers). Default `werift` until mediasoup parity ships and we
@@ -178,6 +188,7 @@ export function loadConfig(): Config {
     operatorPubkey: envHex('SFU_OPERATOR_PUBKEY'),
     allowedPubkeys,
     allowAll: (process.env.SFU_ALLOW_ALL ?? '').trim() === '1',
+    requireAllowedPubkey: (process.env.SFU_REQUIRE_ALLOWED_PUBKEY ?? '').trim() === '1',
     engine: (process.env.SFU_ENGINE ?? '').trim() === 'mediasoup' ? 'mediasoup' : 'werift',
     relays,
     trustedAuthorRelays,

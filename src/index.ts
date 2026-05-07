@@ -24,6 +24,7 @@ import { HttpServer } from './http-server.js';
 import { MembershipTracker } from './membership.js';
 import { RelayPool } from './relay.js';
 import { RoomManager } from './room-manager.js';
+import { TestPeerSpawner } from './test-peer-spawner.js';
 import { createMediasoupEngine, type MediasoupEngine } from './mediasoup-server.js';
 import { loadConfig, reloadAllowList, type Config } from './config.js';
 import { applyOverrides, loadRuntimeOverrides } from './admin.js';
@@ -46,7 +47,11 @@ async function main(): Promise<void> {
     cap: cfg.maxParticipantsPerRoom,
   });
 
-  const relay = new RelayPool(cfg.relays, identity);
+  // Trusted-author relays are subscribe-only — the SFU isn't necessarily
+  // whitelisted for writes there, but it needs to read incoming `start`
+  // and kind 25050 traffic from them. Pool them in as read-only so
+  // every subscribe() naturally fans across the union.
+  const relay = new RelayPool(cfg.relays, identity, cfg.trustedAuthorRelays);
   const membership = new MembershipTracker(relay);
 
   // mediasoup engine: only spun up when SFU_ENGINE=mediasoup. The werift
@@ -59,11 +64,17 @@ async function main(): Promise<void> {
   const rooms = new RoomManager(cfg, relay, membership, mediasoupEngine);
   const advertiser = new Advertiser(cfg, relay);
   const listener = new CallListener(cfg, relay, rooms);
+  // Test-peer spawner is mediasoup-only — the script drives a PlainTransport
+  // via POST /test/inject, which doesn't exist on the werift engine.
+  const testPeers = cfg.engine === 'mediasoup'
+    ? new TestPeerSpawner(cfg, identity.pubkey)
+    : null;
   const http = new HttpServer({
     cfg,
     sfuPubkey: identity.pubkey,
     rooms,
     bootedAt,
+    testPeers,
   });
 
   await advertiser.start();
@@ -86,6 +97,7 @@ async function main(): Promise<void> {
     http.setShuttingDown();
     listener.stop();
     advertiser.stop();
+    testPeers?.stopAll();
 
     try {
       await rooms.closeAll();
