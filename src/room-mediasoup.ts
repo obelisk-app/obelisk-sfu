@@ -1047,8 +1047,12 @@ export class MediasoupRoom {
     peer.unhealthyTimers.clear();
     // Remove from table BEFORE closing transports so the close observer's
     // `this.peers.get(peerKey(peer.pubkey, peer.clientId)) === peer` check short-circuits and we
-    // don't double-fire the peerLeft fanout.
-    this.peers.delete(peer.pubkey);
+    // don't double-fire the peerLeft fanout. Pre-multi-device the map was
+    // keyed on pubkey alone; the composite-key migration missed this one
+    // delete site, so until 2026-05-08 every leave/kick/reap cascaded into
+    // a duplicate peerLeft + producerClosed storm and a brief ghost-peer
+    // window — visible to operators as channel-switch flicker.
+    this.peers.delete(peerKey(peer.pubkey, peer.clientId));
     // Fire producerClosed before peerLeft per bug #1 ordering rule.
     for (const producerId of peer.producers.keys()) {
       for (const other of this.peers.values()) {

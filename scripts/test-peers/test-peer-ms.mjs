@@ -254,11 +254,23 @@ ffa.on('exit', (code) => console.log('[test-ms] ffmpeg audio exited', code));
 
 console.log('[test-ms] running. Ctrl-C to exit.');
 
-// Periodic stats so pm2 logs show progress.
+// Hard self-exit cap — defends against the operator forgetting to stop a
+// debug peer (a forgotten test peer used to pin a CPU for 23 hours
+// before it was noticed). Override per-spawn via env; default 30 min is
+// long enough for any real interactive test session.
+const MAX_LIFETIME_SEC = Math.max(60, Number(process.env.TEST_PEER_MAX_LIFETIME_SEC) || 1800);
+console.log('[test-ms] max lifetime', MAX_LIFETIME_SEC, 's');
+
+// Periodic stats so pm2 logs show progress, AND enforce the lifetime cap
+// in the same wakeup so we don't burn an extra timer.
 let lastReport = Date.now();
 setInterval(() => {
   const elapsed = Math.floor((Date.now() - lastReport) / 1000);
   console.log('[test-ms] still running — uptime', elapsed, 's');
+  if (elapsed >= MAX_LIFETIME_SEC) {
+    console.log('[test-ms] reached max lifetime', MAX_LIFETIME_SEC, 's — exiting');
+    cleanup();
+  }
 }, 30_000);
 
 const cleanup = () => {

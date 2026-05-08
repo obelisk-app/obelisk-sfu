@@ -25,6 +25,7 @@ import { MembershipTracker } from './membership.js';
 import { RelayPool } from './relay.js';
 import { RoomManager } from './room-manager.js';
 import { TestPeerSpawner } from './test-peer-spawner.js';
+import { reapTestPeerOrphans } from './orphan-reaper.js';
 import { createMediasoupEngine, type MediasoupEngine } from './mediasoup-server.js';
 import { loadConfig, reloadAllowList, type Config } from './config.js';
 import { applyOverrides, loadRuntimeOverrides } from './admin.js';
@@ -69,6 +70,14 @@ async function main(): Promise<void> {
   const testPeers = cfg.engine === 'mediasoup'
     ? new TestPeerSpawner(cfg, identity.pubkey)
     : null;
+  // Sweep ffmpeg orphans from any prior SFU instance that exited via
+  // SIGKILL before its spawner could send SIGTERM. One-shot, only at boot,
+  // BEFORE any new spawn — otherwise we'd kill our own freshly-launched
+  // children. The 2026-05-07 incident was load avg 13 from three of these.
+  if (cfg.engine === 'mediasoup') {
+    const killed = reapTestPeerOrphans();
+    if (killed > 0) log.warn('reaped orphan test-peer ffmpegs at boot', { killed });
+  }
   const http = new HttpServer({
     cfg,
     sfuPubkey: identity.pubkey,

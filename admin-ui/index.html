@@ -59,6 +59,9 @@
   .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; background: var(--lc-border); color: var(--lc-muted); }
   .badge.live { background: var(--lc-green); color: #0a0a0a; }
   .err { color: var(--lc-red); }
+  #live-badge { font-size: 11px; padding: 4px 10px; border-radius: 9999px; border: 1px solid var(--lc-border); }
+  #live-badge.live-on { color: var(--lc-green); border-color: var(--lc-green); }
+  #live-badge.live-off { color: var(--lc-muted); }
 </style>
 </head>
 <body>
@@ -128,6 +131,7 @@
       <button id="save-btn" class="pill pill-primary">Save</button>
       <button id="restart-btn" class="pill pill-danger">Restart SFU</button>
       <button id="refresh-btn" class="pill">Refresh</button>
+      <span id="live-badge" class="mono live-on" title="Auto-refreshes every 5 s while the tab is visible">● live</span>
     </div>
   </section>
 
@@ -232,6 +236,7 @@
         $('test-peers-card').style.display = '';
       }
       $('auth-state').innerHTML = `<span class="badge live">●</span> <span class="mono">${nip19.npubEncode(myPubkey)}</span>`;
+      startAutoRefresh();
     } catch (err) {
       $('login-err').textContent = err.message;
     }
@@ -242,7 +247,85 @@
     render(snapshot);
   }
 
+  // Auto-refresh: poll /admin/state on a 5 s interval so the active rooms
+  // and test-peer cards reflect reality without the operator hammering
+  // the Refresh button. Pauses while the tab is hidden (saves NIP-98
+  // signEvent round-trips on the user's signer); resumes on focus.
+  // Backs off after repeated failures so a transient signer issue
+  // doesn't spam toasts.
+  const AUTO_REFRESH_INTERVAL_MS = 5000;
+  const AUTO_REFRESH_MAX_FAILURES = 3;
+  let autoRefreshTimer = null;
+  let autoRefreshInflight = false;
+  let autoRefreshFailures = 0;
+
+  async function autoRefreshTick() {
+    if (document.hidden) return;
+    if (autoRefreshInflight) return;
+    autoRefreshInflight = true;
+    try {
+      const s = await api('/admin/state', 'GET');
+      snapshot = s;
+      renderLive(s);
+      autoRefreshFailures = 0;
+      setLiveBadge(true);
+    } catch (err) {
+      autoRefreshFailures++;
+      if (autoRefreshFailures >= AUTO_REFRESH_MAX_FAILURES) {
+        stopAutoRefresh();
+        setLiveBadge(false, 'paused after errors — click Refresh');
+      } else {
+        setLiveBadge(false, `retry ${autoRefreshFailures}/${AUTO_REFRESH_MAX_FAILURES}`);
+      }
+    } finally {
+      autoRefreshInflight = false;
+    }
+  }
+
+  function startAutoRefresh() {
+    if (autoRefreshTimer) return;
+    autoRefreshTimer = setInterval(autoRefreshTick, AUTO_REFRESH_INTERVAL_MS);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    setLiveBadge(true);
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+  }
+
+  function onVisibilityChange() {
+    // Becoming visible after a hidden stretch — fire one tick immediately
+    // so the operator sees fresh data without waiting up to 5 s.
+    if (!document.hidden) autoRefreshTick();
+  }
+
+  function setLiveBadge(live, label) {
+    const el = $('live-badge');
+    if (!el) return;
+    el.textContent = live ? '● live' : ('○ ' + (label || 'paused'));
+    el.className = 'mono ' + (live ? 'live-on' : 'live-off');
+  }
+
   function render(s) {
+    renderLive(s);
+    // Inputs only on the FULL render path (initial load + manual Refresh).
+    // Auto-refresh skips these so a half-typed setting isn't clobbered.
+    $('i-relays').value = s.relays.join('\n');
+    $('i-trusted').value = s.trustedAuthorRelays.join('\n');
+    $('i-allowed').value = s.allowed.join('\n');
+    $('i-allowAll').checked = !!s.allowAll;
+    $('i-requireAllowedPubkey').checked = !!s.requireAllowedPubkey;
+    $('i-publicUrl').value = s.publicUrl || '';
+    $('i-region').value = s.region || '';
+    $('i-operator').value = s.operator || '';
+  }
+
+  // Read-only live data — safe to redraw repeatedly without disturbing
+  // anything the operator is editing. Called by both render() and the
+  // auto-refresh tick.
+  function renderLive(s) {
     $('f-pubkey').textContent = s.pubkey;
     $('f-npub').textContent = nip19.npubEncode(s.pubkey);
     $('f-operator').textContent = `${s.operator}\n(${nip19.npubEncode(s.operator)})`;
@@ -251,19 +334,11 @@
     $('f-engine').textContent = s.engine;
     $('f-cap').textContent = `${s.maxParticipantsPerRoom}/room · ${s.maxRooms} concurrent`;
 
-    $('i-relays').value = s.relays.join('\n');
-    $('i-trusted').value = s.trustedAuthorRelays.join('\n');
     // Test-peer relay textarea: only prefill the placeholder hint so the
     // operator sees what the default would be without it being treated as
     // an override. Real default lives server-side in TestPeerSpawner.spawn.
     const trel = $('i-test-relays');
     if (trel) trel.placeholder = s.relays.join('\n') || 'wss://relay.example';
-    $('i-allowed').value = s.allowed.join('\n');
-    $('i-allowAll').checked = !!s.allowAll;
-    $('i-requireAllowedPubkey').checked = !!s.requireAllowedPubkey;
-    $('i-publicUrl').value = s.publicUrl || '';
-    $('i-region').value = s.region || '';
-    $('i-operator').value = s.operator || '';
 
     const list = $('rooms-list');
     if (!s.activeRooms || s.activeRooms.length === 0) {
