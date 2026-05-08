@@ -66,24 +66,9 @@ async function main(): Promise<void> {
   const listener = new CallListener(cfg, relay, rooms);
   // Test-peer spawner is mediasoup-only — the script drives a PlainTransport
   // via POST /test/inject, which doesn't exist on the werift engine.
-  // Limits are intentionally conservative: a forgotten test peer eats 1+
-  // CPU per ffmpeg, and prior incidents had operators leaving 3 peers
-  // running for a day (load avg 13 on 4 cores → SFU starvation). Override
-  // via env if you really need more concurrent test peers.
   const testPeers = cfg.engine === 'mediasoup'
-    ? new TestPeerSpawner(cfg, identity.pubkey, {
-        maxConcurrent: Math.max(1, Number(process.env.SFU_TEST_PEER_MAX_CONCURRENT) || 5),
-        maxLifetimeSec: Math.max(60, Number(process.env.SFU_TEST_PEER_MAX_LIFETIME_SEC) || 1800),
-      })
+    ? new TestPeerSpawner(cfg, identity.pubkey)
     : null;
-  // Sweep ffmpeg orphans left by any prior SFU instance that was killed
-  // before its spawner could clean up. Must run before any new spawn —
-  // the reaper refuses to fire when peers are tracked, to avoid
-  // self-killing.
-  if (testPeers) {
-    const killed = testPeers.reapOrphans();
-    if (killed > 0) log.warn('reaped orphan test-peer ffmpegs at boot', { killed });
-  }
   const http = new HttpServer({
     cfg,
     sfuPubkey: identity.pubkey,
@@ -113,7 +98,6 @@ async function main(): Promise<void> {
     listener.stop();
     advertiser.stop();
     testPeers?.stopAll();
-    testPeers?.dispose();
 
     try {
       await rooms.closeAll();

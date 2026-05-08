@@ -137,8 +137,8 @@
   </section>
 
   <section id="test-peers-card" class="card" style="display:none">
-    <h2>Test peers <span id="test-peers-limits" class="muted mono" style="font-size:11px;font-weight:normal;margin-left:8px"></span></h2>
-    <p class="muted">Spawn synthetic ffmpeg-driven mediasoup producers in an active room to smoke-test forwarding without two real browsers. Each spawn gets a fresh ephemeral identity. Peers auto-stop after the configured max lifetime so a forgotten test peer can't pin a CPU forever.</p>
+    <h2>Test peers</h2>
+    <p class="muted">Spawn synthetic ffmpeg-driven mediasoup producers in an active room to smoke-test forwarding without two real browsers. Each spawn gets a fresh ephemeral identity.</p>
     <div class="field">
       <label>Channel id (hex, 8–64 chars)</label>
       <input type="text" id="i-test-channel" placeholder="abc123…"/>
@@ -298,49 +298,31 @@
       });
     }
 
-    renderTestPeers(s.testPeers, s.testPeerLimits);
+    renderTestPeers(s.testPeers);
   }
 
-  function fmtAge(sec) {
-    if (sec == null) return '—';
-    if (sec < 60) return sec + 's';
-    if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
-    return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
-  }
-
-  function renderTestPeers(peers, limits) {
-    const limitsEl = $('test-peers-limits');
-    if (limitsEl) {
-      limitsEl.textContent = limits
-        ? `${limits.active}/${limits.maxConcurrent} active · auto-stop @ ${fmtAge(limits.maxLifetimeSec)}`
-        : '';
-    }
+  function renderTestPeers(peers) {
     const list = $('test-peers-list');
     if (!list) return;
     if (!peers || peers.length === 0) {
       list.innerHTML = '<p class="muted">No test peers running.</p>';
       return;
     }
-    list.innerHTML = peers.map((p) => {
-      const remaining = Math.max(0, (p.maxLifetimeSec || 0) - (p.ageSec || 0));
-      return `
+    list.innerHTML = peers.map((p) => `
       <details>
         <summary>
           <span class="mono">${p.peerId}</span>
           · channel <span class="mono">${p.channelId.slice(0, 12)}…</span>
           · pid ${p.pid ?? '—'}
-          · age <span class="mono">${fmtAge(p.ageSec)}</span>
           <button class="pill pill-danger" data-stop-peer="${p.peerId}" style="margin-left:8px;font-size:11px;padding:4px 10px">Stop</button>
         </summary>
         <div class="kv" style="margin-top:8px">
           <div>Pubkey</div><div class="mono">${p.pubkey}</div>
           <div>Started</div><div class="mono">${new Date(p.startedAt * 1000).toISOString()}</div>
-          <div>Auto-stop in</div><div class="mono">${fmtAge(remaining)}</div>
           <div>Relays</div><div class="mono">${(p.relays || []).join('<br>') || '—'}</div>
         </div>
       </details>
-    `;
-    }).join('');
+    `).join('');
 
     list.querySelectorAll('button[data-stop-peer]').forEach((btn) => {
       btn.addEventListener('click', async (ev) => {
