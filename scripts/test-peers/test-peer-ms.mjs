@@ -20,6 +20,15 @@
  * dex's mediasoup-client `SfuClient` will see the producers via
  * `newProducer` notifications and consume them as normal tracks.
  *
+ * Self-termination paths (added 2026-05-08):
+ *   - Hard max lifetime via TEST_PEER_MAX_LIFETIME_SEC (default 1800s).
+ *   - Parent-pid liveness check every 30s — if the SFU that spawned us
+ *     has died, we exit. This is what catches the "SFU SIGKILL → orphan
+ *     ffmpegs pin CPU forever" bug.
+ *   - ffmpegs are spawned as their own process group so the cleanup
+ *     handler can kill the whole group atomically, even if one of the
+ *     ffmpegs is mid-syscall.
+ *
  * Usage:
  *   node scripts/test-peers/test-peer-ms.mjs <channel-id-hex>
  *
@@ -31,6 +40,7 @@
  *                         the on-disk identity in scripts/.test-peer-ms/.
  *   SFU_PUBKEY, SFU_URL — skip kind 31313 discovery and target this SFU.
  *   TEST_PEER_RELAYS    — comma-separated relay URLs (default public.obelisk.ar).
+ *   TEST_PEER_MAX_LIFETIME_SEC — hard exit after this many seconds (default 1800).
  */
 
 import { spawn } from 'node:child_process';
@@ -244,29 +254,79 @@ const audioArgs = [
   '-f', 'rtp', `rtp://${audio.rtpListenIp}:${audio.rtpListenPort}?pkt_size=1200`,
 ];
 
+// ffmpegs share THIS process's group (we ourselves are a group leader
+// because the spawner set detached:true on us). That means when the SFU
+// calls `kill(-scriptPid, 'SIGTERM')` on shutdown, every ffmpeg in this
+// group gets SIGTERM in the same syscall — atomic, no orphan window.
+// stdio inherit so ffmpeg log lines reach pm2.
 console.log('[test-ms] spawning ffmpeg (video)…');
-const ffv = spawn('ffmpeg', videoArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+const ffv = spawn('ffmpeg', videoArgs, {
+  stdio: ['ignore', 'inherit', 'inherit'],
+});
 console.log('[test-ms] spawning ffmpeg (audio)…');
-const ffa = spawn('ffmpeg', audioArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+const ffa = spawn('ffmpeg', audioArgs, {
+  stdio: ['ignore', 'inherit', 'inherit'],
+});
 
 ffv.on('exit', (code) => console.log('[test-ms] ffmpeg video exited', code));
 ffa.on('exit', (code) => console.log('[test-ms] ffmpeg audio exited', code));
 
 console.log('[test-ms] running. Ctrl-C to exit.');
 
-// Periodic stats so pm2 logs show progress.
-let lastReport = Date.now();
+const startedAt = Date.now();
+const maxLifetimeSec = Math.max(60, Number(process.env.TEST_PEER_MAX_LIFETIME_SEC) || 1800);
+const initialPpid = process.ppid;
+console.log('[test-ms] reliability guards: maxLifetimeSec=', maxLifetimeSec, 'parentPid=', initialPpid);
+
+// Periodic stats so pm2 logs show progress, and a chance to enforce the
+// max-lifetime + parent-liveness checks. One timer for everything.
 setInterval(() => {
-  const elapsed = Math.floor((Date.now() - lastReport) / 1000);
-  console.log('[test-ms] still running — uptime', elapsed, 's');
+  const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+  console.log('[test-ms] still running — uptime', elapsedSec, 's');
+
+  // (1) Hard lifetime cap. The spawner enforces this too, but doing it
+  // here means we exit even if reparented to init (i.e., spawner died).
+  if (elapsedSec >= maxLifetimeSec) {
+    console.log('[test-ms] reached max lifetime', maxLifetimeSec, 's — exiting');
+    cleanup();
+    return;
+  }
+
+  // (2) Parent-pid liveness. If the spawning SFU died (any cause), the
+  // syscall throws ESRCH and we self-terminate. Catches "SFU got SIGKILL,
+  // pm2 restarted it, the new SFU doesn't know we exist" — without this,
+  // ffmpeg would happily keep pumping UDP into nothing for hours.
+  if (initialPpid && initialPpid !== 1) {
+    try {
+      process.kill(initialPpid, 0);
+    } catch (err) {
+      if (err && err.code === 'ESRCH') {
+        console.log('[test-ms] parent SFU pid', initialPpid, 'is gone — exiting');
+        cleanup();
+      }
+    }
+  }
 }, 30_000);
 
-const cleanup = () => {
+let cleaningUp = false;
+function cleanup() {
+  if (cleaningUp) return;
+  cleaningUp = true;
   console.log('[test-ms] shutting down');
-  try { ffv.kill('SIGTERM'); } catch { /* ignore */ }
-  try { ffa.kill('SIGTERM'); } catch { /* ignore */ }
+  for (const ff of [ffv, ffa]) {
+    if (ff?.pid == null) continue;
+    try { ff.kill('SIGTERM'); } catch { /* gone */ }
+  }
   try { pool.close(RELAYS); } catch { /* ignore */ }
-  setTimeout(() => process.exit(0), 500);
-};
+  // SIGKILL anything that ignored SIGTERM, then exit. ffmpeg is normally
+  // well-behaved; this guards against the rare hang during muxer shutdown.
+  setTimeout(() => {
+    for (const ff of [ffv, ffa]) {
+      if (ff?.pid == null) continue;
+      try { ff.kill('SIGKILL'); } catch { /* gone */ }
+    }
+    process.exit(0);
+  }, 1_000);
+}
 process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);

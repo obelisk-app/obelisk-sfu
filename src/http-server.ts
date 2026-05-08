@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { createLogger } from './log.js';
 import type { Config } from './config.js';
 import type { RoomManager } from './room-manager.js';
-import type { TestPeerSpawner } from './test-peer-spawner.js';
+import { TestPeerCapError, type TestPeerSpawner } from './test-peer-spawner.js';
 import {
   AuthError,
   applyOverrides,
@@ -237,6 +237,11 @@ export class HttpServer {
       });
       json(res, 200, info);
     } catch (err) {
+      // Concurrent-cap rejection should be a client-visible 429 so the
+      // admin UI can show "stop one first" instead of a generic 500.
+      if (err instanceof TestPeerCapError) {
+        return json(res, 429, { error: err.message, code: err.code, cap: err.cap });
+      }
       json(res, 500, { error: (err as Error).message });
     }
   }
@@ -282,6 +287,7 @@ export class HttpServer {
         startedAt: r.startedAt,
       })),
       testPeers: this.deps.testPeers ? this.deps.testPeers.list() : null,
+      testPeerLimits: this.deps.testPeers ? this.deps.testPeers.limits() : null,
     };
   }
 
