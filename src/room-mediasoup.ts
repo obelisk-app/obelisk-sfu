@@ -1205,6 +1205,11 @@ export class MediasoupRoom {
   }
 
   private async publishActiveCall(): Promise<void> {
+    // Count distinct pubkeys (NOT clientIds) — a user with two devices in
+    // the room is one participant from every other client's UI perspective.
+    // Synthetic test peers count too; they're real audio sources.
+    const distinctPubkeys = new Set<Hex>();
+    for (const peer of this.peers.values()) distinctPubkeys.add(peer.pubkey);
     await this.relay.publish({
       kind: KIND_SFU_ACTIVE_CALL,
       content: '',
@@ -1213,6 +1218,11 @@ export class MediasoupRoom {
         ['e', this.channelId],
         ['host', this.hostPubkey],
         ['status', this._status],
+        // Live participant count. Dex consumers hide the "LIVE" badge
+        // when this is 0 — otherwise the room shows live for the full
+        // empty-grace window (default 300 s) after the last person
+        // leaves, even though nobody can be heard.
+        ['count', String(distinctPubkeys.size)],
         ['expiration', String(Math.floor(Date.now() / 1000) + ACTIVE_CALL_TTL_SECONDS)],
         ['t', 'obelisk-sfu-active-call'],
       ],

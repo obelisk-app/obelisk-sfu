@@ -421,6 +421,9 @@ export class Room {
       ['host', this.hostPubkey],
       ['cap', String(this._rules.maxParticipants ?? this.cfg.maxParticipantsPerRoom)],
       ['status', this._status],
+      // Live participant count — dex hides the "LIVE" badge at 0 so an
+      // empty room during empty-grace doesn't keep flashing live.
+      ['count', String(this.peers.size)],
       ['expiration', String(expiration)],
     ];
     if (this.cfg.publicUrl) tags.push(['url', this.cfg.publicUrl]);
