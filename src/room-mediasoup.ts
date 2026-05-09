@@ -199,6 +199,15 @@ export class MediasoupRoom {
    * ground truth for "is this peer actually doing anything."
    */
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Empty-room grace timer. Closes the room {@link Config.emptyGraceSeconds}
+   * after the last peer leaves; cleared the moment a new peer joins. Pre-fix
+   * the mediasoup room had no empty-grace at all (only the legacy werift
+   * room did) so a room with everyone gone stayed `active` forever and
+   * kept publishing kind 31314 status='active' — clients would see a phantom
+   * "live call" badge in channels nobody was actually in.
+   */
+  private emptyTimer: ReturnType<typeof setTimeout> | null = null;
 
   private _status: RoomStatus = 'starting';
   private startedAt = 0;
@@ -325,6 +334,10 @@ export class MediasoupRoom {
         joinedAt: now,
       };
       this.peers.set(syntheticKey, synthetic);
+      // Synthetic test peer counts as a participant for the empty-grace
+      // timer's purposes — clear any pending close so the test peer's
+      // existence doesn't expire mid-test.
+      this.cancelEmptyTimer();
     }
     synthetic.producers.set(producer.id, producer);
     synthetic.producerAppData.set(producer.id, meta);
@@ -388,6 +401,7 @@ export class MediasoupRoom {
     }
     await this.sendNotification(targetPubkey, 'kicked', { reason: reason ?? null });
     this.fanoutPeerLeft(targetPubkey);
+    this.maybeStartEmptyTimer();
   }
 
   /**
@@ -428,12 +442,57 @@ export class MediasoupRoom {
     if (!userStillPresent) {
       this.fanoutPeerLeft(peer.pubkey);
     }
+    this.maybeStartEmptyTimer();
   }
 
   private fanoutPeerLeft(pubkey: Hex): void {
     for (const other of this.peers.values()) {
       if (!other.recvTransport) continue;
       void this.sendNotification(other.pubkey, 'peerLeft', { pubkey });
+    }
+  }
+
+  /**
+   * Start (or restart) the empty-room grace timer if the peer table just
+   * became empty. Idempotent — a second call while the timer is already
+   * armed is a no-op. Closes the room after `cfg.emptyGraceSeconds`
+   * unless a new peer joins in the meantime; the timer is cleared by
+   * {@link cancelEmptyTimer} on every peer add.
+   *
+   * Also publishes a fresh kind 31314 with `status='active'` but ZERO
+   * participants so subscribers see "the room exists, nobody's in it"
+   * within one publish cycle instead of waiting for the next periodic
+   * activeCall publish — channels that go briefly empty during a
+   * channel-switch shouldn't flap clients' "live call" badge.
+   */
+  private maybeStartEmptyTimer(): void {
+    if (this._status !== 'active') return;
+    if (this.peers.size > 0) return;
+    if (this.emptyTimer) return;
+    log.info('room empty — grace timer started', {
+      channel: this.channelId.slice(0, 8),
+      seconds: this.cfg.emptyGraceSeconds,
+    });
+    // Refresh the kind 31314 immediately with the empty roster so
+    // subscribers see the headcount drop without waiting up to
+    // ACTIVE_CALL_INTERVAL_MS for the next periodic tick.
+    void this.publishActiveCall().catch(() => undefined);
+    this.emptyTimer = setTimeout(() => {
+      this.emptyTimer = null;
+      if (this.peers.size === 0 && this._status === 'active') {
+        log.info('room empty grace expired — closing', {
+          channel: this.channelId.slice(0, 8),
+        });
+        void this.close().catch((err) => log.warn('empty-grace close threw', { err: (err as Error).message }));
+      }
+    }, this.cfg.emptyGraceSeconds * 1000);
+    this.emptyTimer.unref?.();
+  }
+
+  private cancelEmptyTimer(): void {
+    if (this.emptyTimer) {
+      clearTimeout(this.emptyTimer);
+      this.emptyTimer = null;
     }
   }
 
@@ -512,6 +571,7 @@ export class MediasoupRoom {
     if (this.beaconTimer) { clearInterval(this.beaconTimer); this.beaconTimer = null; }
     if (this.activeCallTimer) { clearInterval(this.activeCallTimer); this.activeCallTimer = null; }
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    this.cancelEmptyTimer();
     // Clear any per-peer ICE/DTLS sweep timers so a slow shutdown doesn't
     // leave them firing into a closed Room.
     for (const peer of this.peers.values()) {
@@ -671,6 +731,10 @@ export class MediasoupRoom {
         joinedAt: now,
       };
       this.peers.set(key, p);
+      // First peer back in — cancel any pending empty-room close so a
+      // user briefly toggling devices or refreshing their tab doesn't
+      // lose the room out from under them mid-grace.
+      this.cancelEmptyTimer();
     }
     return p;
   }
@@ -1002,9 +1066,21 @@ export class MediasoupRoom {
       producer.close();
       peer.producers.delete(data.producerId);
       peer.producerAppData.delete(data.producerId);
-      // mediasoup fires `producerclose` on every consumer of this producer
-      // automatically, so peers see the consumer-end event without us
-      // needing to fan it out manually here.
+      // Server-side mediasoup auto-closes the corresponding server-side
+      // Consumers when a producer closes, but mediasoup-CLIENT does NOT
+      // get a wire signal from that — its Consumer object stays open
+      // until the underlying track times out (10s+). Pre-fix we relied
+      // on that auto-close and didn't fan out, so a remote camera/screen
+      // toggle-off left a frozen tile in every other peer's UI until
+      // they reloaded. Explicit notification is the only fast signal.
+      // Skip the peer who owns the producer (their own UI already knows);
+      // same-pubkey other-clientId peers (multi-device) DO get notified
+      // because they were consuming this producer.
+      for (const other of this.peers.values()) {
+        if (other === peer) continue;
+        if (!other.recvTransport) continue;
+        void this.sendNotification(other.pubkey, 'producerClosed', { producerId: data.producerId });
+      }
       return {};
     },
 
@@ -1063,6 +1139,7 @@ export class MediasoupRoom {
     this.fanoutPeerLeft(peer.pubkey);
     try { peer.sendTransport?.close(); } catch { /* ignore */ }
     try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    this.maybeStartEmptyTimer();
   }
 
   /**
