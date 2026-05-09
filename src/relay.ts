@@ -18,6 +18,24 @@ import type { Identity } from './identity.js';
 
 const log = createLogger('relay');
 
+/**
+ * Snapshot of one relay's recent activity. Timestamps are unix seconds.
+ * `null` means "we haven't seen this signal yet on this relay since boot."
+ */
+export interface RelayHealth {
+  url: string;
+  /** Read- and/or write-side, mostly informational. */
+  role: 'write' | 'read';
+  /** Last time a publish to this relay resolved successfully. */
+  lastPublishOk: number | null;
+  /** Last time a publish to this relay was rejected. */
+  lastPublishErr: number | null;
+  /** Last error message (truncated) recorded for this relay. */
+  lastPublishErrMsg: string | null;
+  /** Last time a subscribed event OR EOSE was delivered from this relay. */
+  lastEventAt: number | null;
+}
+
 export class RelayPool {
   private readonly pool: SimplePool;
   private closed = false;
@@ -32,6 +50,19 @@ export class RelayPool {
    * when the SFU isn't whitelisted on them itself.
    */
   private readonly readOnlyRelays: string[];
+
+  /** Per-relay last-successful-publish unix-seconds timestamp. */
+  private readonly lastPublishOk = new Map<string, number>();
+  /** Per-relay last-failed-publish unix-seconds timestamp. */
+  private readonly lastPublishErr = new Map<string, number>();
+  /** Per-relay last-failed-publish error message (truncated to 200 chars). */
+  private readonly lastPublishErrMsg = new Map<string, string>();
+  /**
+   * Per-relay last-time-we-saw-something timestamp (an event delivery or
+   * an EOSE marker, both indicate a live connection at that instant).
+   * Read by the call-listener watchdog to detect silently-dead subscriptions.
+   */
+  private readonly lastEventAt = new Map<string, number>();
 
   constructor(
     relays: string[],
@@ -76,17 +107,24 @@ export class RelayPool {
 
     let firstAck: string | null = null;
     let firstErr: unknown = null;
+    const now = Math.floor(Date.now() / 1000);
     await Promise.allSettled(
       results.map((p, i) =>
         p
           .then(() => {
             const relayUrl = this.writeRelays[i];
-            if (relayUrl && !firstAck) firstAck = relayUrl;
+            if (relayUrl) {
+              this.lastPublishOk.set(relayUrl, now);
+              if (!firstAck) firstAck = relayUrl;
+            }
           })
           .catch((err) => {
+            const relayUrl = this.writeRelays[i] ?? '(unknown)';
+            this.lastPublishErr.set(relayUrl, now);
+            this.lastPublishErrMsg.set(relayUrl, String((err as Error)?.message ?? err).slice(0, 200));
             if (!firstErr) firstErr = err;
             log.debug('publish relay rejected', {
-              relay: this.writeRelays[i] ?? '(unknown)',
+              relay: relayUrl,
               kind: event.kind,
               err: (err as Error)?.message,
             });
@@ -170,15 +208,92 @@ export class RelayPool {
     }
     const closers: Array<() => void> = [];
     for (const r of relays) {
-      const sub = this.pool.subscribeMany([r], filter, {
-        onevent: (ev: Event) => onEvent(ev, r),
-        onauth: this.signAuthChallenge,
-      });
-      closers.push(() => sub.close());
+      closers.push(this.subscribeOneRelay(r, filter, onEvent));
     }
     return () => {
       for (const c of closers) c();
     };
+  }
+
+  /**
+   * Subscribe to a filter on exactly one relay. Used by the CallListener
+   * watchdog so it can rebuild a single relay's subscription without
+   * disturbing the others when that relay's stream goes silent.
+   *
+   * Both event deliveries and EOSE markers update {@link lastEventAt} —
+   * either is evidence the underlying socket is still alive. The watchdog
+   * uses this signal to decide when to resubscribe.
+   *
+   * Sets a baseline `lastEventAt = now` at subscribe time so the watchdog
+   * doesn't immediately flag a brand-new subscription as stale during the
+   * brief window before the relay's first response arrives.
+   */
+  subscribeOneRelay(
+    url: string,
+    filter: Filter,
+    onEvent: (ev: Event, sourceRelay: string) => void,
+  ): () => void {
+    if (this.closed) {
+      log.warn('subscribeOneRelay after close — no-op', { relay: url });
+      return () => undefined;
+    }
+    this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
+    const sub = this.pool.subscribeMany([url], filter, {
+      onevent: (ev: Event) => {
+        this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
+        onEvent(ev, url);
+      },
+      oneose: () => {
+        this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
+      },
+      onauth: this.signAuthChallenge,
+    });
+    return () => sub.close();
+  }
+
+  /** Last-time-saw-something timestamp for a relay (unix seconds), or null. */
+  getLastEventAt(url: string): number | null {
+    return this.lastEventAt.get(url) ?? null;
+  }
+
+  /**
+   * Update {@link lastEventAt} for a relay to "now". The CallListener
+   * watchdog calls this right after issuing a resubscribe so the new
+   * subscription gets a grace window before the next staleness check —
+   * otherwise a still-silent relay would be flagged again on the next tick.
+   */
+  touchLastEventAt(url: string): void {
+    this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
+  }
+
+  /**
+   * Snapshot of every configured relay's recent activity. Powers the
+   * /admin/state relays panel and the /healthz "all-relays-down" check.
+   */
+  getRelayHealth(): RelayHealth[] {
+    const out: RelayHealth[] = [];
+    for (const url of this.writeRelays) {
+      out.push({
+        url,
+        role: 'write',
+        lastPublishOk: this.lastPublishOk.get(url) ?? null,
+        lastPublishErr: this.lastPublishErr.get(url) ?? null,
+        lastPublishErrMsg: this.lastPublishErrMsg.get(url) ?? null,
+        lastEventAt: this.lastEventAt.get(url) ?? null,
+      });
+    }
+    for (const url of this.readOnlyRelays) {
+      out.push({
+        url,
+        role: 'read',
+        // Read-only relays are never published to, so these stay null.
+        lastPublishOk: null,
+        lastPublishErr: null,
+        lastPublishErrMsg: null,
+        lastEventAt: this.lastEventAt.get(url) ?? null,
+      });
+    }
+    return out;
   }
 
   close(): void {

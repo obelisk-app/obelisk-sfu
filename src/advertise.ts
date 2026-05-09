@@ -19,7 +19,14 @@ import type { RelayPool } from './relay.js';
 
 const log = createLogger('advertise');
 
-const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+/**
+ * How often we re-publish kind 31313. Pre-fix this was 6 h, which meant a
+ * relay losing the parameterized-replaceable event left clients unable to
+ * discover the SFU for hours. Five minutes is short enough that any
+ * forgetful relay catches the next refresh within one user attempt, and
+ * cheap enough (12 publishes/h × N relays) that bandwidth is a non-issue.
+ */
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 export class Advertiser {
   private timer: NodeJS.Timeout | null = null;
@@ -33,6 +40,16 @@ export class Advertiser {
    */
   private readonly sessionId: string = randomBytes(8).toString('hex');
   private readonly bootedAt: number = Math.floor(Date.now() / 1000);
+  /**
+   * Unix-seconds timestamp of the last advertise publish that resolved
+   * (any relay accepting it counts). Surfaced via {@link getStatus} so
+   * the admin UI can show "last advertised X ago" — a more useful health
+   * signal than uptime alone, since a relay-deaf SFU can have great uptime
+   * and a stale advertisement at the same time.
+   */
+  private lastPublishAt: number | null = null;
+  /** Same as {@link lastPublishAt} but for failures. */
+  private lastPublishErrAt: number | null = null;
 
   constructor(
     private readonly cfg: Config,
@@ -55,6 +72,22 @@ export class Advertiser {
     }, REFRESH_INTERVAL_MS);
     // Don't keep the event loop alive solely for the heartbeat.
     this.timer.unref?.();
+  }
+
+  getStatus(): {
+    sessionId: string;
+    bootedAt: number;
+    lastPublishAt: number | null;
+    lastPublishErrAt: number | null;
+    refreshIntervalMs: number;
+  } {
+    return {
+      sessionId: this.sessionId,
+      bootedAt: this.bootedAt,
+      lastPublishAt: this.lastPublishAt,
+      lastPublishErrAt: this.lastPublishErrAt,
+      refreshIntervalMs: REFRESH_INTERVAL_MS,
+    };
   }
 
   /**
@@ -136,17 +169,32 @@ export class Advertiser {
 
     if (this.cfg.region) tags.push(['region', this.cfg.region]);
 
+    // Capture the second-precision timestamp BEFORE awaiting so we can
+    // tell, after the fact, whether any relay's lastPublishOk advanced
+    // during this attempt. RelayPool.publish() doesn't surface success/
+    // failure (it logs and resolves regardless, by design — many callers
+    // rely on the swallow-failures contract for non-critical events), but
+    // its per-relay maps record both outcomes; we read from those.
+    const startedAt = Math.floor(Date.now() / 1000);
     await this.relay.publish({
       kind: KIND_SFU_ADVERTISEMENT,
       content: '',
       tags,
       created_at: Math.floor(Date.now() / 1000),
     });
+    const health = this.relay.getRelayHealth();
+    const ackedRelay = health.find((h) => h.lastPublishOk != null && h.lastPublishOk >= startedAt);
+    if (ackedRelay) {
+      this.lastPublishAt = Math.floor(Date.now() / 1000);
+    } else {
+      this.lastPublishErrAt = Math.floor(Date.now() / 1000);
+    }
     log.info('advertisement published', {
       pubkey: this.relay.pubkey.slice(0, 12) + '…',
       allowed: this.cfg.allowedPubkeys.size,
       cap: this.cfg.maxParticipantsPerRoom,
       url: this.cfg.publicUrl ?? '(unset)',
+      ack: ackedRelay?.url ?? null,
     });
   }
 }

@@ -34,7 +34,20 @@ const STARTING_RULES: RoomRules = {
 };
 
 export class CallListener {
-  private unsub: (() => void) | null = null;
+  /**
+   * url → unsubscribe function for that relay's individual subscription.
+   * The watchdog rebuilds entries here on a per-relay basis when the
+   * underlying stream goes silent, without disturbing peer relays.
+   */
+  private subscriptions = new Map<string, () => void>();
+  /**
+   * Filter we re-use on every (re)subscribe. Captured at start() time so
+   * `since` reflects boot, not the moment of the resubscribe — otherwise
+   * a watchdog rebuild would skip events the original subscription was
+   * already filtering for.
+   */
+  private filter: { kinds: number[]; since: number } | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
   /**
    * Event-id → expiry timestamp (unix seconds). We subscribe per relay
    * (so we can distinguish trusted vs untrusted sources), so an event
@@ -43,6 +56,16 @@ export class CallListener {
    */
   private seenEventIds = new Map<string, number>();
 
+  /** How often the watchdog checks each relay's last-seen timestamp. */
+  static readonly WATCHDOG_INTERVAL_MS = 30_000;
+  /**
+   * If a relay hasn't delivered an event OR an EOSE in this window,
+   * the watchdog tears down its subscription and rebuilds it. Five minutes
+   * is long enough to ride out a quiet but live relay (control traffic is
+   * sparse) and short enough that recovery happens within one user attempt.
+   */
+  static readonly WATCHDOG_STALENESS_MS = 5 * 60_000;
+
   constructor(
     private readonly cfg: Config,
     private readonly relay: RelayPool,
@@ -50,8 +73,9 @@ export class CallListener {
   ) {}
 
   start(): void {
-    if (this.unsub) return;
+    if (this.subscriptions.size > 0) return;
     const since = Math.floor(Date.now() / 1000) - 60;
+    this.filter = { kinds: [KIND_SFU_CONTROL], since };
     // Subscribe per-relay so we know which relay delivered each event.
     // Events seen on a trusted-author relay bypass the allow.json check
     // (the relay's own write-whitelist authorized the publisher).
@@ -61,24 +85,77 @@ export class CallListener {
     const allRelays = Array.from(
       new Set([...this.cfg.relays, ...this.cfg.trustedAuthorRelays]),
     );
-    this.unsub = this.relay.subscribePerRelay(
-      allRelays,
-      {
-        kinds: [KIND_SFU_CONTROL],
-        since,
-      },
-      (ev, source) => this.handle(ev, source),
-    );
+    for (const url of allRelays) this.subscribeRelay(url);
+
     log.info('listening for control events', {
       pubkey: this.relay.pubkey.slice(0, 12) + '…',
       relays: allRelays.length,
       trusted: this.cfg.trustedAuthorRelays.length,
     });
+
+    // Watchdog: detect silently-dead per-relay subscriptions and rebuild
+    // them. Without this, a relay disconnect leaves the SFU appearing alive
+    // (HTTP up, process running) but deaf to incoming `start` events — the
+    // pre-fix failure mode that forced the operator to mash the Restart
+    // button before every call.
+    this.watchdogTimer = setInterval(() => this.tickWatchdog(), CallListener.WATCHDOG_INTERVAL_MS);
+    this.watchdogTimer.unref?.();
   }
 
   stop(): void {
-    this.unsub?.();
-    this.unsub = null;
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    for (const unsub of this.subscriptions.values()) {
+      try { unsub(); } catch { /* best effort */ }
+    }
+    this.subscriptions.clear();
+    this.filter = null;
+  }
+
+  /**
+   * Per-relay snapshot for the admin UI. Pairs the RelayPool's
+   * lastEventAt with whether we currently hold a subscription on this
+   * URL — `subscribed=false` means the listener never wired this relay
+   * (e.g., the URL was added at runtime but not yet picked up).
+   */
+  getRelayStatus(): Array<{ url: string; subscribed: boolean }> {
+    return [...this.subscriptions.keys()].map((url) => ({ url, subscribed: true }));
+  }
+
+  private subscribeRelay(url: string): void {
+    if (!this.filter) return;
+    // Tear down any existing subscription for this URL first so a watchdog
+    // rebuild doesn't leak the previous nostr-tools sub object.
+    const prev = this.subscriptions.get(url);
+    if (prev) {
+      try { prev(); } catch { /* best effort */ }
+    }
+    const unsub = this.relay.subscribeOneRelay(
+      url,
+      this.filter,
+      (ev, source) => this.handle(ev, source),
+    );
+    this.subscriptions.set(url, unsub);
+  }
+
+  private tickWatchdog(): void {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const stalenessSec = Math.floor(CallListener.WATCHDOG_STALENESS_MS / 1000);
+    for (const url of this.subscriptions.keys()) {
+      const last = this.relay.getLastEventAt(url);
+      const ageSec = last == null ? Infinity : nowSec - last;
+      if (ageSec > stalenessSec) {
+        log.warn('subscription stale, resubscribing', { relay: url, ageSec });
+        this.subscribeRelay(url);
+        // Grace window: subscribeOneRelay touches lastEventAt to "now",
+        // so the next watchdog tick won't immediately re-flag this URL
+        // even if the underlying socket is still wedged. By the time the
+        // grace window elapses we'll either have seen an EOSE/event (good)
+        // or we'll resubscribe again (still better than the pre-fix coma).
+      }
+    }
   }
 
   /** Returns true if this is the first time we see the event id. */

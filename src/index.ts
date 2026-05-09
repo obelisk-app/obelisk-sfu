@@ -83,6 +83,9 @@ async function main(): Promise<void> {
     sfuPubkey: identity.pubkey,
     rooms,
     bootedAt,
+    relay,
+    advertiser,
+    listener,
     testPeers,
   });
 

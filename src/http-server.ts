@@ -18,7 +18,10 @@ import { resolve, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createLogger } from './log.js';
+import type { Advertiser } from './advertise.js';
+import type { CallListener } from './call-listener.js';
 import type { Config } from './config.js';
+import type { RelayPool } from './relay.js';
 import type { RoomManager } from './room-manager.js';
 import type { TestPeerSpawner } from './test-peer-spawner.js';
 import {
@@ -38,6 +41,12 @@ export interface HttpServerDeps {
   sfuPubkey: string;
   rooms: RoomManager;
   bootedAt: number;
+  /** Required for relay health surfaced in /admin/state and /healthz. */
+  relay: RelayPool;
+  /** Required for last-advertise timestamp surfaced in /admin/state. */
+  advertiser: Advertiser;
+  /** Required for per-relay subscription status in /admin/state. */
+  listener: CallListener;
   /**
    * Optional test-peer spawner — exposed at /admin/test-peer/* when present.
    * Mediasoup-only (the spawned script needs the PlainTransport injection
@@ -45,6 +54,13 @@ export interface HttpServerDeps {
    */
   testPeers: TestPeerSpawner | null;
 }
+
+/**
+ * /healthz returns 503 if NO relay has acknowledged a publish in this many
+ * seconds. Single-relay degradation stays 200 so a flapping non-critical
+ * relay doesn't trigger pointless restarts; total deafness should page.
+ */
+const HEALTHZ_ALL_RELAYS_DEAD_SEC = 15 * 60;
 
 export class HttpServer {
   private server: Server | null = null;
@@ -260,6 +276,14 @@ export class HttpServer {
 
   private adminSnapshot() {
     const cfg = this.deps.cfg;
+    // Fold the listener's per-relay subscription presence into each entry
+    // from RelayPool's health snapshot — operators want to see "publish ok
+    // AND I'm still subscribed" as a single row, not two parallel lists.
+    const subscribedSet = new Set(this.deps.listener.getRelayStatus().map((s) => s.url));
+    const relayHealth = this.deps.relay.getRelayHealth().map((h) => ({
+      ...h,
+      subscribed: subscribedSet.has(h.url),
+    }));
     return {
       pubkey: this.deps.sfuPubkey,
       operator: effectiveOperator(cfg, this.deps.sfuPubkey),
@@ -281,6 +305,8 @@ export class HttpServer {
         host: r.hostPubkey,
         startedAt: r.startedAt,
       })),
+      relayHealth,
+      advertiser: this.deps.advertiser.getStatus(),
       testPeers: this.deps.testPeers ? this.deps.testPeers.list() : null,
     };
   }
@@ -504,9 +530,30 @@ export class HttpServer {
     if (this.shuttingDown) {
       return json(res, 503, { status: 'draining' });
     }
+    // Total relay deafness check: if it's been longer than the threshold
+    // since boot AND no write-relay has acked any publish in the threshold
+    // window, the SFU is silently broken — every client that needs us is
+    // hitting a kind 31313 from a relay we're no longer in touch with.
+    // 503 makes this visible to monitoring without forcing a restart for
+    // partial degradation (one of N relays going wonky stays 200).
+    const now = Math.floor(Date.now() / 1000);
+    const uptime = now - this.deps.bootedAt;
+    if (uptime > HEALTHZ_ALL_RELAYS_DEAD_SEC) {
+      const writeRelays = this.deps.relay.getRelayHealth().filter((h) => h.role === 'write');
+      const anyAlive = writeRelays.some(
+        (h) => h.lastPublishOk != null && now - h.lastPublishOk < HEALTHZ_ALL_RELAYS_DEAD_SEC,
+      );
+      if (writeRelays.length > 0 && !anyAlive) {
+        return json(res, 503, {
+          status: 'degraded',
+          reason: 'no live relays',
+          uptime,
+        });
+      }
+    }
     json(res, 200, {
       status: 'ok',
-      uptime: Math.floor(Date.now() / 1000) - this.deps.bootedAt,
+      uptime,
       activeRooms: this.deps.rooms.size(),
     });
   }

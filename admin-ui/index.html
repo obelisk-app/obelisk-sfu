@@ -62,6 +62,16 @@
   #live-badge { font-size: 11px; padding: 4px 10px; border-radius: 9999px; border: 1px solid var(--lc-border); }
   #live-badge.live-on { color: var(--lc-green); border-color: var(--lc-green); }
   #live-badge.live-off { color: var(--lc-muted); }
+  /* Relay health pills — green=fresh, yellow=stale-ish, red=dead/no-publish. */
+  .pill-status { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .pill-status.ok { background: var(--lc-green); color: #0a0a0a; }
+  .pill-status.warn { background: #facc15; color: #0a0a0a; }
+  .pill-status.bad { background: var(--lc-red); color: var(--lc-white); }
+  .pill-status.idle { background: var(--lc-border); color: var(--lc-muted); }
+  .relay-row { padding: 8px 0; border-bottom: 1px solid var(--lc-border); font-size: 12px; }
+  .relay-row:last-child { border-bottom: none; }
+  .relay-row .url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .relay-row .meta { color: var(--lc-muted); font-size: 11px; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -88,7 +98,16 @@
       <div>Region</div>          <div class="mono" id="f-region"></div>
       <div>Engine</div>          <div class="mono" id="f-engine"></div>
       <div>Capacity</div>        <div class="mono" id="f-cap"></div>
+      <div>Last advertised</div> <div class="mono" id="f-lastAdvertised"></div>
     </div>
+  </section>
+
+  <section id="relays-card" class="card" style="display:none">
+    <h2>Relay health</h2>
+    <p class="muted" style="font-size:12px;margin:0 0 12px">
+      Green = recent publish OR recent inbound event. Yellow = no inbound activity in &gt;5 min (subscription may be wedging). Red = publish failing or no liveness signal at all. Pre-fix, this whole panel went dark while the SFU sat alive but deaf — the symptom that forced a manual restart before every call.
+    </p>
+    <div id="relays-list"></div>
   </section>
 
   <section id="settings-card" class="card" style="display:none">
@@ -228,6 +247,7 @@
       await refresh();
       $('login-card').style.display = 'none';
       $('state-card').style.display = '';
+      $('relays-card').style.display = '';
       $('settings-card').style.display = '';
       $('rooms-card').style.display = '';
       // Test peers card only when the SFU is on mediasoup; werift can't
@@ -333,6 +353,16 @@
     $('f-region').textContent = s.region || '—';
     $('f-engine').textContent = s.engine;
     $('f-cap').textContent = `${s.maxParticipantsPerRoom}/room · ${s.maxRooms} concurrent`;
+    const adv = s.advertiser;
+    if (adv && adv.lastPublishAt) {
+      $('f-lastAdvertised').textContent = `${formatAge(adv.lastPublishAt)} ago · session ${adv.sessionId}`;
+    } else if (adv) {
+      $('f-lastAdvertised').textContent = `never · session ${adv.sessionId}`;
+    } else {
+      $('f-lastAdvertised').textContent = '—';
+    }
+
+    renderRelays(s.relayHealth || []);
 
     // Test-peer relay textarea: only prefill the placeholder hint so the
     // operator sees what the default would be without it being treated as
@@ -374,6 +404,78 @@
     }
 
     renderTestPeers(s.testPeers);
+  }
+
+  // Compact human-readable age for unix-seconds timestamps. The relay
+  // health panel is busy enough without ISO strings — operators want
+  // "12s ago" / "4m ago", not absolute times. Returns "—" for null.
+  function formatAge(ts) {
+    if (ts == null) return '—';
+    const ageSec = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (ageSec < 60) return `${ageSec}s`;
+    if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m`;
+    if (ageSec < 86400) return `${Math.floor(ageSec / 3600)}h`;
+    return `${Math.floor(ageSec / 86400)}d`;
+  }
+
+  // Roll the per-relay timestamps into a single visual status:
+  //   ok   → recent publish OR recent inbound event (≤5 min)
+  //   warn → ack within 15 min but nothing fresh — subscription may be quiet
+  //   bad  → publish failing or no signal at all in >15 min
+  //   idle → read-only relay we haven't seen anything from yet (no publish path)
+  function relayStatus(h) {
+    const now = Math.floor(Date.now() / 1000);
+    const FRESH = 5 * 60;
+    const STALE = 15 * 60;
+    const okPub = h.lastPublishOk != null && (now - h.lastPublishOk) <= FRESH;
+    const okEvt = h.lastEventAt != null && (now - h.lastEventAt) <= FRESH;
+    if (okPub || okEvt) return 'ok';
+    if (h.role === 'write') {
+      if (h.lastPublishOk != null && (now - h.lastPublishOk) <= STALE) return 'warn';
+      return 'bad';
+    }
+    // read-only: bad iff we've actually seen something stale, otherwise idle
+    if (h.lastEventAt != null && (now - h.lastEventAt) > STALE) return 'bad';
+    if (h.lastEventAt != null) return 'warn';
+    return 'idle';
+  }
+
+  function renderRelays(health) {
+    const list = $('relays-list');
+    if (!list) return;
+    if (health.length === 0) {
+      list.innerHTML = '<p class="muted">No relays configured.</p>';
+      return;
+    }
+    list.innerHTML = health.map((h) => {
+      const st = relayStatus(h);
+      const sub = h.subscribed ? '✓ subscribed' : '✗ not subscribed';
+      const pubBits = h.role === 'write'
+        ? ` · publish ok ${formatAge(h.lastPublishOk)} ago · err ${formatAge(h.lastPublishErr)} ago`
+        : ' · read-only';
+      const errMsg = (h.role === 'write' && h.lastPublishErrMsg && st !== 'ok')
+        ? `<div class="meta err">last err: ${escapeHtml(h.lastPublishErrMsg)}</div>`
+        : '';
+      return `
+        <div class="relay-row">
+          <div>
+            <span class="url">${escapeHtml(h.url)}</span>
+            <span class="pill-status ${st}">${st.toUpperCase()}</span>
+            <span class="badge" style="margin-left:6px">${h.role}</span>
+          </div>
+          <div class="meta">
+            event ${formatAge(h.lastEventAt)} ago${pubBits} · ${sub}
+          </div>
+          ${errMsg}
+        </div>
+      `;
+    }).join('');
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[c]);
   }
 
   function renderTestPeers(peers) {
