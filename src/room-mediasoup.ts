@@ -144,6 +144,8 @@ interface PeerState {
   producers: Map<string, ms.Producer>;
   /** Consumers we created on the peer's recvTransport (key: producerId). */
   consumers: Map<string, ms.Consumer>;
+  /** PlainTransports owned by synthetic/test producers (key: producerId). */
+  plainTransports: Map<string, ms.PlainTransport>;
   /** Voice-level metadata per producer (camera vs screen, origin, etc.). */
   producerAppData: Map<string, { kind: 'audio' | 'camera' | 'screen' | 'screen-audio'; originPubkey: Hex }>;
   /**
@@ -283,23 +285,33 @@ export class MediasoupRoom {
       rtcpMux: false,
       comedia: true, // bind remote address from first packet — caller doesn't need to set DTLS/connect
     });
-    log.info('test inject transport', {
-      channelId: this.channelId.slice(0, 8),
-      kind: opts.kind,
-      transportId: transport.id,
-      rtp: `${transport.tuple.localIp}:${transport.tuple.localPort}`,
-      rtcp: transport.rtcpTuple
-        ? `${transport.rtcpTuple.localIp}:${transport.rtcpTuple.localPort}`
-        : '(muxed)',
-    });
+    let producer: ms.Producer | null = null;
+    try {
+      log.info('test inject transport', {
+        channelId: this.channelId.slice(0, 8),
+        kind: opts.kind,
+        transportId: transport.id,
+        rtp: `${transport.tuple.localIp}:${transport.tuple.localPort}`,
+        rtcp: transport.rtcpTuple
+          ? `${transport.rtcpTuple.localIp}:${transport.rtcpTuple.localPort}`
+          : '(muxed)',
+      });
 
-    const producer = await transport.produce({
-      kind: opts.kind,
-      rtpParameters: {
-        codecs: [codec],
-        encodings: [{ ssrc }],
-      },
-    });
+      producer = await transport.produce({
+        kind: opts.kind,
+        rtpParameters: {
+          codecs: [codec],
+          encodings: [{ ssrc }],
+        },
+      });
+    } catch (err) {
+      try { transport.close(); } catch { /* ignore */ }
+      throw err;
+    }
+    if (!producer) {
+      try { transport.close(); } catch { /* ignore */ }
+      throw new Error('test producer creation failed');
+    }
 
     // Stash a synthetic peer record so room snapshots / consumer-newProducer
     // notifications carry the right origin attribution. We don't add to
@@ -327,6 +339,7 @@ export class MediasoupRoom {
         clientId: SYNTHETIC_CLIENT_ID,
         producers: new Map(),
         consumers: new Map(),
+        plainTransports: new Map(),
         producerAppData: new Map(),
         unhealthyTimers: new Map(),
         lastInboundPacketAt: now,
@@ -339,8 +352,20 @@ export class MediasoupRoom {
       // existence doesn't expire mid-test.
       this.cancelEmptyTimer();
     }
-    synthetic.producers.set(producer.id, producer);
-    synthetic.producerAppData.set(producer.id, meta);
+    const syntheticPeer = synthetic;
+    syntheticPeer.producers.set(producer.id, producer);
+    syntheticPeer.plainTransports.set(producer.id, transport);
+    syntheticPeer.producerAppData.set(producer.id, meta);
+    producer.observer.on('close', () => {
+      syntheticPeer.producers.delete(producer.id);
+      syntheticPeer.producerAppData.delete(producer.id);
+      const plainTransport = syntheticPeer.plainTransports.get(producer.id);
+      syntheticPeer.plainTransports.delete(producer.id);
+      try { plainTransport?.close(); } catch { /* ignore */ }
+    });
+    transport.observer.on('close', () => {
+      syntheticPeer.plainTransports.delete(producer.id);
+    });
 
     // First time we've seen this synthetic origin pubkey — announce it as
     // a new participant so every recv-transport-bearing peer adds the
@@ -396,8 +421,7 @@ export class MediasoupRoom {
           void this.sendNotification(other.pubkey, 'producerClosed', { producerId });
         }
       }
-      try { peer.sendTransport?.close(); } catch { /* ignore */ }
-      try { peer.recvTransport?.close(); } catch { /* ignore */ }
+      this.closePeerMedia(peer);
     }
     await this.sendNotification(targetPubkey, 'kicked', { reason: reason ?? null });
     this.fanoutPeerLeft(targetPubkey);
@@ -442,6 +466,7 @@ export class MediasoupRoom {
     if (!userStillPresent) {
       this.fanoutPeerLeft(peer.pubkey);
     }
+    this.closePeerMedia(peer);
     this.maybeStartEmptyTimer();
   }
 
@@ -450,6 +475,28 @@ export class MediasoupRoom {
       if (!other.recvTransport) continue;
       void this.sendNotification(other.pubkey, 'peerLeft', { pubkey });
     }
+  }
+
+  private closePeerMedia(peer: PeerState): void {
+    for (const t of peer.unhealthyTimers.values()) clearTimeout(t);
+    peer.unhealthyTimers.clear();
+    for (const consumer of Array.from(peer.consumers.values())) {
+      try { consumer.close(); } catch { /* ignore */ }
+    }
+    peer.consumers.clear();
+    for (const producer of Array.from(peer.producers.values())) {
+      try { producer.close(); } catch { /* ignore */ }
+    }
+    peer.producers.clear();
+    peer.producerAppData.clear();
+    for (const transport of Array.from(peer.plainTransports.values())) {
+      try { transport.close(); } catch { /* ignore */ }
+    }
+    peer.plainTransports.clear();
+    try { peer.sendTransport?.close(); } catch { /* ignore */ }
+    try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    delete peer.sendTransport;
+    delete peer.recvTransport;
   }
 
   /**
@@ -572,20 +619,13 @@ export class MediasoupRoom {
     if (this.activeCallTimer) { clearInterval(this.activeCallTimer); this.activeCallTimer = null; }
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
     this.cancelEmptyTimer();
-    // Clear any per-peer ICE/DTLS sweep timers so a slow shutdown doesn't
-    // leave them firing into a closed Room.
-    for (const peer of this.peers.values()) {
-      for (const t of peer.unhealthyTimers.values()) clearTimeout(t);
-      peer.unhealthyTimers.clear();
-    }
     this.signalUnsub?.();
     this.signalUnsub = null;
 
-    // Close every peer's transports — mediasoup will close their producers
-    // and consumers automatically. Clients see the transport drop.
-    for (const peer of this.peers.values()) {
-      try { peer.sendTransport?.close(); } catch { /* ignore */ }
-      try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    // Close every peer-owned transport. Synthetic test producers use
+    // PlainTransports, so they need explicit ownership cleanup here too.
+    for (const peer of Array.from(this.peers.values())) {
+      this.closePeerMedia(peer);
     }
     this.peers.clear();
 
@@ -724,6 +764,7 @@ export class MediasoupRoom {
         clientId,
         producers: new Map(),
         consumers: new Map(),
+        plainTransports: new Map(),
         producerAppData: new Map(),
         unhealthyTimers: new Map(),
         lastInboundPacketAt: now,
@@ -1066,6 +1107,9 @@ export class MediasoupRoom {
       producer.close();
       peer.producers.delete(data.producerId);
       peer.producerAppData.delete(data.producerId);
+      const plainTransport = peer.plainTransports.get(data.producerId);
+      peer.plainTransports.delete(data.producerId);
+      try { plainTransport?.close(); } catch { /* ignore */ }
       // Server-side mediasoup auto-closes the corresponding server-side
       // Consumers when a producer closes, but mediasoup-CLIENT does NOT
       // get a wire signal from that — its Consumer object stays open
@@ -1137,8 +1181,7 @@ export class MediasoupRoom {
       }
     }
     this.fanoutPeerLeft(peer.pubkey);
-    try { peer.sendTransport?.close(); } catch { /* ignore */ }
-    try { peer.recvTransport?.close(); } catch { /* ignore */ }
+    this.closePeerMedia(peer);
     this.maybeStartEmptyTimer();
   }
 
@@ -1163,6 +1206,11 @@ export class MediasoupRoom {
       if (this.peers.get(peerKey(peer.pubkey, peer.clientId)) !== peer) continue;
 
       if (peer.producers.size === 0) {
+        // Receive-only peers are legitimate in SFU rooms (muted users,
+        // viewers, or a user who has disabled camera/mic). They still
+        // own a recv transport and can have active consumers, so don't
+        // boot them just because they have not published media.
+        if (peer.recvTransport) continue;
         if (now - peer.joinedAt > NO_PRODUCER_TIMEOUT_MS) {
           this.dropStalePeer(peer, 'no-producers-timeout');
         }
@@ -1201,7 +1249,8 @@ export class MediasoupRoom {
   // ── periodic publishers ────────────────────────────────────────────────
 
   private async publishBeacon(): Promise<void> {
-    await publishSfuBeacon(this.relay, this.channelId, Array.from(this.peers.keys()));
+    const pubkeys = Array.from(new Set(Array.from(this.peers.values()).map((p) => p.pubkey)));
+    await publishSfuBeacon(this.relay, this.channelId, pubkeys);
   }
 
   private async publishActiveCall(): Promise<void> {
