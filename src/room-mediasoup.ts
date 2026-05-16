@@ -96,7 +96,8 @@ const NO_PRODUCER_TIMEOUT_MS = 45_000;
  * clients resolve by requestId and ignore duplicates, and it closes the
  * "getRouterRtpCapabilities timed out, no transports created" race.
  */
-const RPC_RESPONSE_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 7000] as const;
+const RPC_RESPONSE_RETRY_DELAYS_MS = [100, 300, 700, 1200, 2000, 3500, 6000] as const;
+const RPC_NOTIFICATION_RETRY_DELAYS_MS = [150, 500, 1000, 2000, 3500] as const;
 
 /**
  * Per-peer map key. Composed from pubkey + clientId so two devices
@@ -763,7 +764,7 @@ export class MediasoupRoom {
     const notification: RpcNotification = data === undefined
       ? { type: 'notification', method }
       : { type: 'notification', method, data };
-    await this.relay.publish({
+    const event = {
       kind: KIND_VOICE_SIGNAL,
       content: JSON.stringify(notification),
       tags: [
@@ -773,7 +774,24 @@ export class MediasoupRoom {
         ['t', 'obelisk-sfu-rpc'],
       ],
       created_at: Math.floor(Date.now() / 1000),
-    });
+    };
+    await this.relay.publish(event);
+    for (const delayMs of RPC_NOTIFICATION_RETRY_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        void this.relay.publish({
+          ...event,
+          created_at: Math.floor(Date.now() / 1000),
+        }).catch((err) =>
+          log.debug('rpc notification retry publish failed', {
+            to: toPubkey.slice(0, 8),
+            method,
+            delayMs,
+            err: (err as Error).message,
+          }),
+        );
+      }, delayMs);
+      timer.unref?.();
+    }
   }
 
   // ── method handlers ────────────────────────────────────────────────────
