@@ -156,11 +156,10 @@ export class Advertiser {
     // them automatically; no per-user allow-list maintenance.
     for (const r of this.cfg.trustedAuthorRelays) tags.push(['trusted_relay', r]);
 
-    // Codecs the SFU forwards. v0 ships audio (opus) reliably; video is
-    // best-effort. Order is preference for clients that pick.
+    // Codecs the SFU forwards. Keep this aligned with
+    // ROUTER_MEDIA_CODECS in mediasoup-server.ts.
     tags.push(['codec', 'opus']);
-    tags.push(['codec', 'vp9']);
-    tags.push(['codec', 'h264']);
+    tags.push(['codec', 'vp8']);
 
     for (const pk of this.cfg.allowedPubkeys) tags.push(['allow', pk]);
 

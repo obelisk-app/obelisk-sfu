@@ -87,6 +87,16 @@ const RTP_INACTIVITY_TIMEOUT_MS = 30_000;
  * a roster slot indefinitely.
  */
 const NO_PRODUCER_TIMEOUT_MS = 45_000;
+/**
+ * Kind 25050 is ephemeral, and the browser opens its SFU response
+ * subscription immediately before publishing the first RPC request. On
+ * AUTH-gated relays the SFU can receive the request and publish the
+ * response while the browser's inbound subscription is still being
+ * authenticated/retried. Re-sending the same response is safe because
+ * clients resolve by requestId and ignore duplicates, and it closes the
+ * "getRouterRtpCapabilities timed out, no transports created" race.
+ */
+const RPC_RESPONSE_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 7000] as const;
 
 /**
  * Per-peer map key. Composed from pubkey + clientId so two devices
@@ -693,11 +703,11 @@ export class MediasoupRoom {
       notify: (method, data) => this.sendNotification(fromPubkey, method, data),
     };
     const response = await dispatchRequest(this.handlers, ctx, envelope);
-    await this.sendResponse(fromPubkey, response);
+    await this.sendResponse(fromPubkey, response, envelope.method);
   }
 
-  private async sendResponse(toPubkey: Hex, response: unknown): Promise<void> {
-    await this.relay.publish({
+  private buildResponseEvent(toPubkey: Hex, response: unknown) {
+    return {
       kind: KIND_VOICE_SIGNAL,
       content: JSON.stringify(response),
       tags: [
@@ -717,6 +727,31 @@ export class MediasoupRoom {
         ['t', 'obelisk-sfu-rpc'],
       ],
       created_at: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  private async sendResponse(toPubkey: Hex, response: unknown, method: string): Promise<void> {
+    const event = this.buildResponseEvent(toPubkey, response);
+    await this.relay.publish(event);
+    for (const delayMs of RPC_RESPONSE_RETRY_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        void this.relay.publish({
+          ...event,
+          created_at: Math.floor(Date.now() / 1000),
+        }).catch((err) =>
+          log.debug('rpc response retry publish failed', {
+            to: toPubkey.slice(0, 8),
+            method,
+            delayMs,
+            err: (err as Error).message,
+          }),
+        );
+      }, delayMs);
+      timer.unref?.();
+    }
+    log.debug('rpc response sent', {
+      to: toPubkey.slice(0, 8),
+      method,
     });
   }
 
@@ -962,7 +997,11 @@ export class MediasoupRoom {
           ? peer.recvTransport
           : null;
       if (!transport) throw new RpcError('unknown transport', 'NO_TRANSPORT');
-      await transport.connect({ dtlsParameters: data.dtlsParameters });
+      if (transport.dtlsState === 'new') {
+        await transport.connect({ dtlsParameters: data.dtlsParameters });
+      } else if (transport.dtlsState !== 'connecting' && transport.dtlsState !== 'connected') {
+        throw new RpcError(`transport dtls state ${transport.dtlsState}`, 'TRANSPORT_NOT_CONNECTABLE');
+      }
       return {};
     },
 

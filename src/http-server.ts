@@ -412,7 +412,7 @@ export class HttpServer {
       trustedAuthorRelays: this.deps.cfg.trustedAuthorRelays,
       cap: this.deps.cfg.maxParticipantsPerRoom,
       maxRooms: this.deps.cfg.maxRooms,
-      codecs: ['opus', 'vp9', 'h264'],
+      codecs: ['opus', 'vp8'],
       operator: this.deps.cfg.operatorPubkey ?? this.deps.sfuPubkey,
       region: this.deps.cfg.region,
       bootedAt: this.deps.bootedAt,
