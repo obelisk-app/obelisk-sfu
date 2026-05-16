@@ -424,6 +424,7 @@
   //   bad  → publish failing or no signal at all in >15 min
   //   idle → read-only relay we haven't seen anything from yet (no publish path)
   function relayStatus(h) {
+    if (h.access === 'denied' || h.access === 'closed') return 'bad';
     const now = Math.floor(Date.now() / 1000);
     const FRESH = 5 * 60;
     const STALE = 15 * 60;
@@ -440,6 +441,12 @@
     return 'idle';
   }
 
+  function relayStatusLabel(h, st) {
+    if (h.access === 'denied') return 'NO ACCESS';
+    if (h.access === 'closed') return 'CLOSED';
+    return st.toUpperCase();
+  }
+
   function renderRelays(health) {
     const list = $('relays-list');
     if (!list) return;
@@ -449,6 +456,7 @@
     }
     list.innerHTML = health.map((h) => {
       const st = relayStatus(h);
+      const label = relayStatusLabel(h, st);
       const sub = h.subscribed ? '✓ subscribed' : '✗ not subscribed';
       const pubBits = h.role === 'write'
         ? ` · publish ok ${formatAge(h.lastPublishOk)} ago · err ${formatAge(h.lastPublishErr)} ago`
@@ -456,16 +464,22 @@
       const errMsg = (h.role === 'write' && h.lastPublishErrMsg && st !== 'ok')
         ? `<div class="meta err">last err: ${escapeHtml(h.lastPublishErrMsg)}</div>`
         : '';
+      const accessMsg = h.access === 'denied'
+        ? `<div class="meta err">SFU pubkey does not have access to this relay: ${escapeHtml(h.accessDetail || 'relay rejected subscription/publish')}</div>`
+        : (h.access === 'closed' && h.accessDetail
+            ? `<div class="meta err">relay closed SFU subscription: ${escapeHtml(h.accessDetail)}</div>`
+            : '');
       return `
         <div class="relay-row">
           <div>
             <span class="url">${escapeHtml(h.url)}</span>
-            <span class="pill-status ${st}">${st.toUpperCase()}</span>
+            <span class="pill-status ${st}">${label}</span>
             <span class="badge" style="margin-left:6px">${h.role}</span>
           </div>
           <div class="meta">
-            event ${formatAge(h.lastEventAt)} ago${pubBits} · ${sub}
+            event ${formatAge(h.lastEventAt)} ago · closed ${formatAge(h.lastSubscribeClose)} ago${pubBits} · ${sub}
           </div>
+          ${accessMsg}
           ${errMsg}
         </div>
       `;

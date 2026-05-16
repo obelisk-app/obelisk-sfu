@@ -26,12 +26,20 @@ export interface RelayHealth {
   url: string;
   /** Read- and/or write-side, mostly informational. */
   role: 'write' | 'read';
+  /** Current best-effort access classification for this relay. */
+  access: 'ok' | 'denied' | 'closed' | 'unknown';
+  /** Human-readable detail behind a denied/closed access state. */
+  accessDetail: string | null;
   /** Last time a publish to this relay resolved successfully. */
   lastPublishOk: number | null;
   /** Last time a publish to this relay was rejected. */
   lastPublishErr: number | null;
   /** Last error message (truncated) recorded for this relay. */
   lastPublishErrMsg: string | null;
+  /** Last time a subscription to this relay closed or was rejected. */
+  lastSubscribeClose: number | null;
+  /** Last subscription close/rejection reason (truncated). */
+  lastSubscribeCloseMsg: string | null;
   /** Last time a subscribed event OR EOSE was delivered from this relay. */
   lastEventAt: number | null;
 }
@@ -57,6 +65,10 @@ export class RelayPool {
   private readonly lastPublishErr = new Map<string, number>();
   /** Per-relay last-failed-publish error message (truncated to 200 chars). */
   private readonly lastPublishErrMsg = new Map<string, string>();
+  /** Per-relay last subscription close/rejection timestamp. */
+  private readonly lastSubscribeClose = new Map<string, number>();
+  /** Per-relay last subscription close/rejection reason. */
+  private readonly lastSubscribeCloseMsg = new Map<string, string>();
   /**
    * Per-relay last-time-we-saw-something timestamp (an event delivery or
    * an EOSE marker, both indicate a live connection at that instant).
@@ -164,6 +176,12 @@ export class RelayPool {
     const sub = this.pool.subscribeMany(allRelays, filter, {
       onevent: onEvent,
       onauth: this.signAuthChallenge,
+      onclose: (reasons: string[]) => {
+        reasons.forEach((reason, i) => {
+          const relayUrl = allRelays[i];
+          if (relayUrl) this.recordSubscribeClose(relayUrl, reason);
+        });
+      },
       ...(onEose ? { oneose: onEose } : {}),
     });
     return () => sub.close();
@@ -246,6 +264,9 @@ export class RelayPool {
       oneose: () => {
         this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
       },
+      onclose: (reasons: string[]) => {
+        this.recordSubscribeClose(url, reasons[0] ?? 'subscription closed');
+      },
       onauth: this.signAuthChallenge,
     });
     return () => sub.close();
@@ -266,6 +287,39 @@ export class RelayPool {
     this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
   }
 
+  private recordSubscribeClose(url: string, reason: string): void {
+    const msg = String(reason || 'subscription closed').slice(0, 200);
+    if (isLocalSubscriptionClose(msg)) return;
+    this.lastSubscribeClose.set(url, Math.floor(Date.now() / 1000));
+    this.lastSubscribeCloseMsg.set(url, msg);
+    log.debug('subscribe relay closed', { relay: url, reason: msg });
+  }
+
+  private relayAccess(url: string, role: RelayHealth['role']): Pick<RelayHealth, 'access' | 'accessDetail'> {
+    const lastEventAt = this.lastEventAt.get(url) ?? null;
+    const lastPublishOk = role === 'write' ? (this.lastPublishOk.get(url) ?? null) : null;
+    const lastPublishErr = role === 'write' ? (this.lastPublishErr.get(url) ?? null) : null;
+    const lastPublishErrMsg = role === 'write' ? (this.lastPublishErrMsg.get(url) ?? null) : null;
+    const lastSubscribeClose = this.lastSubscribeClose.get(url) ?? null;
+    const lastSubscribeCloseMsg = this.lastSubscribeCloseMsg.get(url) ?? null;
+
+    const lastOk = Math.max(lastEventAt ?? 0, lastPublishOk ?? 0);
+    const failures: Array<{ at: number; msg: string | null }> = [];
+    if (lastPublishErr != null) failures.push({ at: lastPublishErr, msg: lastPublishErrMsg });
+    if (lastSubscribeClose != null) failures.push({ at: lastSubscribeClose, msg: lastSubscribeCloseMsg });
+    failures.sort((a, b) => b.at - a.at);
+    const lastFailure = failures[0] ?? null;
+
+    if (lastOk > 0 && (!lastFailure || lastOk >= lastFailure.at)) {
+      return { access: 'ok', accessDetail: null };
+    }
+    if (!lastFailure) return { access: 'unknown', accessDetail: null };
+    if (isRelayAccessDenied(lastFailure.msg)) {
+      return { access: 'denied', accessDetail: lastFailure.msg };
+    }
+    return { access: 'closed', accessDetail: lastFailure.msg };
+  }
+
   /**
    * Snapshot of every configured relay's recent activity. Powers the
    * /admin/state relays panel and the /healthz "all-relays-down" check.
@@ -273,23 +327,31 @@ export class RelayPool {
   getRelayHealth(): RelayHealth[] {
     const out: RelayHealth[] = [];
     for (const url of this.writeRelays) {
+      const access = this.relayAccess(url, 'write');
       out.push({
         url,
         role: 'write',
+        ...access,
         lastPublishOk: this.lastPublishOk.get(url) ?? null,
         lastPublishErr: this.lastPublishErr.get(url) ?? null,
         lastPublishErrMsg: this.lastPublishErrMsg.get(url) ?? null,
+        lastSubscribeClose: this.lastSubscribeClose.get(url) ?? null,
+        lastSubscribeCloseMsg: this.lastSubscribeCloseMsg.get(url) ?? null,
         lastEventAt: this.lastEventAt.get(url) ?? null,
       });
     }
     for (const url of this.readOnlyRelays) {
+      const access = this.relayAccess(url, 'read');
       out.push({
         url,
         role: 'read',
+        ...access,
         // Read-only relays are never published to, so these stay null.
         lastPublishOk: null,
         lastPublishErr: null,
         lastPublishErrMsg: null,
+        lastSubscribeClose: this.lastSubscribeClose.get(url) ?? null,
+        lastSubscribeCloseMsg: this.lastSubscribeCloseMsg.get(url) ?? null,
         lastEventAt: this.lastEventAt.get(url) ?? null,
       });
     }
@@ -302,4 +364,31 @@ export class RelayPool {
     this.pool.close([...this.writeRelays, ...this.readOnlyRelays]);
     log.info('relay pool closed');
   }
+}
+
+function isRelayAccessDenied(reason: string | null): boolean {
+  if (!reason) return false;
+  const lower = reason.toLowerCase();
+  return [
+    'auth-required',
+    'auth was required',
+    'restricted',
+    'not authorized',
+    'not authorised',
+    'not allowed',
+    'forbidden',
+    'permission',
+    'blocked',
+    'whitelist',
+    'blacklist',
+    'access denied',
+    'acl',
+  ].some((needle) => lower.includes(needle));
+}
+
+function isLocalSubscriptionClose(reason: string): boolean {
+  const lower = reason.toLowerCase();
+  return lower === 'closed by caller'
+    || lower === 'relay connection closed by us'
+    || lower === '<aborted>';
 }
