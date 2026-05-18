@@ -29,6 +29,7 @@ import { reapTestPeerOrphans } from './orphan-reaper.js';
 import { createMediasoupEngine, type MediasoupEngine } from './mediasoup-server.js';
 import { loadConfig, reloadAllowList, type Config } from './config.js';
 import { applyOverrides, loadRuntimeOverrides } from './admin.js';
+import { syncTrustedReferentFollows } from './follow-whitelist.js';
 
 const log = createLogger('main');
 
@@ -40,6 +41,11 @@ async function main(): Promise<void> {
   // admin panel. .env stays as the operator's static baseline.
   applyOverrides(cfg, loadRuntimeOverrides());
   const identity = createIdentity(cfg.nsecHex);
+  if (cfg.trustedReferentPubkeys.size > 0) {
+    void syncTrustedReferentFollows(cfg).catch((err) =>
+      log.warn('trusted referent follow sync failed', { err: (err as Error).message }),
+    );
+  }
 
   log.info('boot', {
     pubkey: identity.pubkey,
@@ -140,16 +146,83 @@ async function main(): Promise<void> {
     log.error('uncaughtException', { err: err.message, stack: err.stack });
     void shutdown('uncaughtException', 1);
   });
+  // Treat unhandledRejection the same as uncaughtException. Previously this
+  // only logged, which left the process running in a half-broken state
+  // (rooms still publishing kind 31314 while their RPC handlers were dead).
+  // systemd's `Restart=on-failure` only kicks in on non-zero exit, so a
+  // silent zombie was the single biggest "needs manual restart" vector —
+  // exiting(1) here is what gives the supervisor a signal to act on.
   process.on('unhandledRejection', (err) => {
     log.error('unhandledRejection', {
       err: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
     });
+    void shutdown('unhandledRejection', 1);
   });
+
+  // ── Self-heal watchdog ────────────────────────────────────────────────
+  // Polls the same predicates the public /healthz uses, but on a faster
+  // cadence and with a hysteresis window. If health has been bad for the
+  // full window we exit(1) — systemd then restarts a clean process. This
+  // is the catch-all for failure modes that aren't "the process threw":
+  //   - every write relay has been silent for too long (we'd be a phantom
+  //     advertisement on relays nobody listens to)
+  //   - relay subscriptions wedged in a way the call-listener watchdog
+  //     couldn't unwedge
+  //   - any future degraded-but-running state we add a predicate for
+  const WATCHDOG_INTERVAL_MS = 30_000;
+  const WATCHDOG_GRACE_MS = 5 * 60_000;
+  let firstBadAt: number | null = null;
+  const watchdog = setInterval(() => {
+    if (shuttingDown) return;
+    const now = Date.now();
+    const reason = degradedReason(now);
+    if (reason == null) {
+      if (firstBadAt != null) log.info('watchdog: health recovered');
+      firstBadAt = null;
+      return;
+    }
+    if (firstBadAt == null) {
+      firstBadAt = now;
+      log.warn('watchdog: health degraded — restart pending if not recovered', { reason });
+      return;
+    }
+    const badFor = now - firstBadAt;
+    if (badFor >= WATCHDOG_GRACE_MS) {
+      log.error('watchdog: degraded too long — exiting for supervisor restart', {
+        reason,
+        degradedForSeconds: Math.floor(badFor / 1000),
+      });
+      void shutdown(`watchdog:${reason}`, 1);
+    }
+  }, WATCHDOG_INTERVAL_MS);
+  watchdog.unref?.();
+
+  function degradedReason(nowMs: number): string | null {
+    const uptimeSec = Math.floor(nowMs / 1000) - bootedAt;
+    // Skip the first WATCHDOG_GRACE_MS of uptime so the SFU has time to
+    // settle a publish-ack on at least one write relay before the watchdog
+    // could mark it as deaf.
+    if (uptimeSec * 1000 < WATCHDOG_GRACE_MS) return null;
+    const writeRelays = relay.getRelayHealth().filter((h) => h.role === 'write');
+    if (writeRelays.length === 0) return null;
+    const nowSec = Math.floor(nowMs / 1000);
+    const anyAlive = writeRelays.some(
+      (h) => h.lastPublishOk != null && nowSec - h.lastPublishOk < Math.floor(WATCHDOG_GRACE_MS / 1000),
+    );
+    if (!anyAlive) return 'all-write-relays-silent';
+    return null;
+  }
 
   // SIGHUP — reload allow-list + republish advertisement.
   process.on('SIGHUP', () => {
     log.info('SIGHUP — reloading allow-list');
     const { added, removed } = reloadAllowList(cfg);
+    if (cfg.trustedReferentPubkeys.size > 0) {
+      void syncTrustedReferentFollows(cfg).catch((err) =>
+        log.warn('trusted referent follow sync failed', { err: (err as Error).message }),
+      );
+    }
     if (added > 0 || removed > 0) {
       void advertiser.republish().catch((err) =>
         log.warn('advertisement republish failed', { err: (err as Error).message }),

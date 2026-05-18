@@ -9,6 +9,7 @@ import { MediasoupRoom } from './room-mediasoup.js';
 import type { Config } from './config.js';
 import type { MediasoupEngine } from './mediasoup-server.js';
 import type { MembershipTracker } from './membership.js';
+import type { RpcNotification, RpcRequest, RpcResponse } from './nostr-rpc.js';
 import type { RelayPool } from './relay.js';
 import type { Hex, RoomRules, RoomSnapshot } from './types.js';
 
@@ -27,6 +28,30 @@ export interface RoomLike {
   kick(targetPubkey: Hex, reason?: string): Promise<void>;
   /** Replace room rules in-place. Re-sends to active peers if their consent changed. */
   updateRules(rules: RoomRules): void;
+  /**
+   * Direct SFU signaling path. Mediasoup rooms support the same RPC envelope
+   * as kind 25050, but over the SFU's authenticated WebSocket. Legacy werift
+   * rooms omit these hooks.
+   */
+  registerDirectSession?(
+    pubkey: Hex,
+    clientId: string,
+    send: (notification: RpcNotification) => void,
+  ): () => void;
+  handleDirectRequest?(
+    fromPubkey: Hex,
+    clientId: string,
+    req: RpcRequest,
+    notify: (method: string, data?: unknown) => Promise<void>,
+  ): Promise<RpcResponse>;
+  handleDirectDisconnect?(pubkey: Hex, clientId: string): void;
+  /**
+   * Re-evaluate the call-duration timer from the (possibly-changed)
+   * `cfg.maxCallDurationSeconds`. The admin panel calls this on every
+   * room when the operator edits the cap so an in-flight call picks up
+   * the new ceiling without a restart.
+   */
+  rearmDurationLimit(): void;
 }
 
 export class RoomManager {
@@ -93,6 +118,18 @@ export class RoomManager {
     const room = this.rooms.get(channelId);
     if (!room) return;
     await room.close();
+  }
+
+  /**
+   * Iterate every active room and ask it to re-arm its duration timer.
+   * Used after the admin updates `cfg.maxCallDurationSeconds`.
+   */
+  rearmDurationLimits(): void {
+    for (const room of this.rooms.values()) {
+      try { room.rearmDurationLimit(); } catch (err) {
+        log.warn('rearmDurationLimit threw', { err: (err as Error).message });
+      }
+    }
   }
 
   /**

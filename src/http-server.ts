@@ -33,6 +33,8 @@ import {
   verifyNip98,
   type RuntimeOverrides,
 } from './admin.js';
+import { attachDirectRpc } from './direct-rpc.js';
+import { syncTrustedReferentFollows } from './follow-whitelist.js';
 
 const log = createLogger('http');
 
@@ -79,6 +81,11 @@ export class HttpServer {
         log.info('http server listening', { port: this.deps.cfg.httpPort });
         resolve();
       });
+      attachDirectRpc(server, {
+        cfg: this.deps.cfg,
+        sfuPubkey: this.deps.sfuPubkey,
+        rooms: this.deps.rooms,
+      });
       this.server = server;
     });
   }
@@ -112,6 +119,9 @@ export class HttpServer {
     }
     if (url === '/admin/restart' && method === 'POST') {
       return void this.handleAdminRestart(req, res);
+    }
+    if (url === '/admin/sync-follows' && method === 'POST') {
+      return void this.handleAdminSyncFollows(req, res);
     }
     if (url === '/admin/test-peers' && method === 'GET') {
       return void this.handleTestPeerList(req, res);
@@ -203,15 +213,60 @@ export class HttpServer {
         }
       }
     }
+    if (patch.trustedReferentPubkeys) {
+      for (const pk of patch.trustedReferentPubkeys) {
+        if (!/^[0-9a-f]{64}$/i.test(pk)) {
+          return json(res, 400, { error: `invalid trusted referent pubkey: ${pk}` });
+        }
+      }
+    }
+    if (patch.whitelistBypassUntil !== undefined && patch.whitelistBypassUntil !== null) {
+      const until = patch.whitelistBypassUntil;
+      const now = Math.floor(Date.now() / 1000);
+      if (typeof until !== 'number' || !Number.isFinite(until) || until < now) {
+        return json(res, 400, { error: 'whitelistBypassUntil must be a future unix timestamp or null' });
+      }
+      if (until - now > 3600) {
+        return json(res, 400, { error: 'whitelistBypassUntil cannot be more than one hour from now' });
+      }
+    }
     if (patch.operatorPubkey && !/^[0-9a-f]{64}$/i.test(patch.operatorPubkey)) {
       return json(res, 400, { error: 'operatorPubkey must be 64-char hex' });
     }
+    if (patch.maxCallDurationSeconds !== undefined) {
+      const n = patch.maxCallDurationSeconds;
+      if (typeof n !== 'number' || !Number.isFinite(n) || n < 0 || n > 24 * 3600) {
+        return json(res, 400, { error: 'maxCallDurationSeconds must be 0..86400 (0 disables the cap)' });
+      }
+    }
 
+    const prevMaxDuration = this.deps.cfg.maxCallDurationSeconds;
     const merged: RuntimeOverrides = { ...loadRuntimeOverrides(), ...patch };
     saveRuntimeOverrides(merged);
     applyOverrides(this.deps.cfg, merged);
+    if (patch.trustedReferentPubkeys) {
+      try { await syncTrustedReferentFollows(this.deps.cfg); }
+      catch (err) { log.warn('trusted referent follow sync failed', { err: (err as Error).message }); }
+    }
+    // If the duration cap changed, re-arm every active room's end timer so
+    // an in-progress call picks up the new ceiling without waiting for a
+    // rules update from the host.
+    if (patch.maxCallDurationSeconds !== undefined &&
+        this.deps.cfg.maxCallDurationSeconds !== prevMaxDuration) {
+      this.deps.rooms.rearmDurationLimits();
+    }
     log.info('admin overrides applied', { keys: Object.keys(patch) });
     json(res, 200, { ok: true, applied: Object.keys(patch), state: this.adminSnapshot() });
+  }
+
+  private async handleAdminSyncFollows(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.authOrFail(req, res, 'POST')) return;
+    try {
+      const result = await syncTrustedReferentFollows(this.deps.cfg);
+      json(res, 200, { ok: true, ...result, state: this.adminSnapshot() });
+    } catch (err) {
+      json(res, 500, { error: (err as Error).message });
+    }
   }
 
   private handleAdminRestart(req: IncomingMessage, res: ServerResponse): void {
@@ -290,12 +345,16 @@ export class HttpServer {
       relays: cfg.relays,
       trustedAuthorRelays: cfg.trustedAuthorRelays,
       allowed: [...cfg.allowedPubkeys],
+      trustedReferentPubkeys: [...cfg.trustedReferentPubkeys],
+      followAllowedCount: cfg.followAllowedPubkeys.size,
+      whitelistBypassUntil: cfg.whitelistBypassUntil,
       allowAll: cfg.allowAll,
       requireAllowedPubkey: cfg.requireAllowedPubkey,
       publicUrl: cfg.publicUrl,
       region: cfg.region,
       maxRooms: cfg.maxRooms,
       maxParticipantsPerRoom: cfg.maxParticipantsPerRoom,
+      maxCallDurationSeconds: cfg.maxCallDurationSeconds,
       engine: cfg.engine,
       bootedAt: this.deps.bootedAt,
       activeRooms: this.deps.rooms.list().map((r) => ({

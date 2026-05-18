@@ -125,6 +125,22 @@
       <label>Allowed pubkeys (hex, one per line)</label>
       <textarea id="i-allowed" rows="3"></textarea>
     </div>
+    <div class="field">
+      <label>Trusted referent pubkeys (hex, one per line)</label>
+      <textarea id="i-referents" rows="3"></textarea>
+      <p class="muted" style="font-size:11px;margin:6px 0 0">
+        The SFU syncs each referent's latest kind 3 contact list and allows followed pubkeys to auth directly.
+      </p>
+    </div>
+    <div class="kv" style="margin-bottom:14px">
+      <div>Follow-derived</div><div class="mono" id="f-followAllowedCount">—</div>
+      <div>Test bypass</div><div class="mono" id="f-whitelistBypass">—</div>
+    </div>
+    <div class="field row">
+      <button id="sync-follows-btn" class="pill">Sync referent follows</button>
+      <button id="bypass-hour-btn" class="pill">Disable whitelist for 1 h</button>
+      <button id="clear-bypass-btn" class="pill">Re-enable whitelist</button>
+    </div>
     <div class="field row">
       <input type="checkbox" id="i-allowAll" />
       <label for="i-allowAll" style="margin:0">Allow all (testing only — bypasses allow-list)</label>
@@ -140,6 +156,11 @@
     <div class="field">
       <label>Region hint</label>
       <input type="text" id="i-region" />
+    </div>
+    <div class="field">
+      <label>Max call duration (seconds, 0 disables)</label>
+      <input type="number" id="i-maxCallDurationSeconds" min="0" max="86400" step="60" />
+      <p class="muted" style="font-size:11px;margin:6px 0 0">Hard cap. Every room auto-closes after this many seconds. Default <span class="mono">3600</span> (1 h). Changes apply to in-progress calls immediately.</p>
     </div>
     <div class="field">
       <label>Operator pubkey (hex)</label>
@@ -335,10 +356,12 @@
     $('i-relays').value = s.relays.join('\n');
     $('i-trusted').value = s.trustedAuthorRelays.join('\n');
     $('i-allowed').value = s.allowed.join('\n');
+    $('i-referents').value = (s.trustedReferentPubkeys || []).join('\n');
     $('i-allowAll').checked = !!s.allowAll;
     $('i-requireAllowedPubkey').checked = !!s.requireAllowedPubkey;
     $('i-publicUrl').value = s.publicUrl || '';
     $('i-region').value = s.region || '';
+    $('i-maxCallDurationSeconds').value = String(s.maxCallDurationSeconds ?? 3600);
     $('i-operator').value = s.operator || '';
   }
 
@@ -363,6 +386,8 @@
     }
 
     renderRelays(s.relayHealth || []);
+    $('f-followAllowedCount').textContent = `${s.followAllowedCount || 0} pubkeys`;
+    $('f-whitelistBypass').textContent = formatWhitelistBypass(s.whitelistBypassUntil);
 
     // Test-peer relay textarea: only prefill the placeholder hint so the
     // operator sees what the default would be without it being treated as
@@ -416,6 +441,13 @@
     if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m`;
     if (ageSec < 86400) return `${Math.floor(ageSec / 3600)}h`;
     return `${Math.floor(ageSec / 86400)}d`;
+  }
+
+  function formatWhitelistBypass(ts) {
+    const now = Math.floor(Date.now() / 1000);
+    if (!ts || ts <= now) return 'disabled';
+    const remaining = Math.ceil((ts - now) / 60);
+    return `active until ${new Date(ts * 1000).toISOString()} (${remaining}m left)`;
   }
 
   // Roll the per-relay timestamps into a single visual status:
@@ -554,21 +586,52 @@
     return s.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
   }
 
+  function parseMaxDuration(raw) {
+    const trimmed = String(raw ?? '').trim();
+    if (trimmed === '') return 3600;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || n < 0) return 3600;
+    return Math.floor(Math.min(n, 86400));
+  }
+
   async function save() {
     if (!confirm('Save changes to runtime.json? Allow-list / allow-all apply immediately; relay changes need a restart.')) return;
     const patch = {
       relays: parseLines($('i-relays').value),
       trustedAuthorRelays: parseLines($('i-trusted').value),
       allowed: parseLines($('i-allowed').value),
+      trustedReferentPubkeys: parseLines($('i-referents').value).map((pk) => pk.toLowerCase()),
       allowAll: $('i-allowAll').checked,
       requireAllowedPubkey: $('i-requireAllowedPubkey').checked,
       publicUrl: $('i-publicUrl').value.trim() || null,
       region: $('i-region').value.trim() || null,
+      maxCallDurationSeconds: parseMaxDuration($('i-maxCallDurationSeconds').value),
       operatorPubkey: $('i-operator').value.trim().toLowerCase() || null,
     };
     try {
       await api('/admin/state', 'PUT', patch);
       toast('Saved', 'ok');
+      await refresh();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function syncFollows() {
+    try {
+      const result = await api('/admin/sync-follows', 'POST');
+      toast(`Synced ${result.derived || 0} followed pubkeys`, 'ok');
+      await refresh();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function setWhitelistBypass(minutes) {
+    const until = minutes > 0 ? Math.floor(Date.now() / 1000) + (minutes * 60) : null;
+    try {
+      await api('/admin/state', 'PUT', { whitelistBypassUntil: until });
+      toast(until ? 'Whitelist disabled for one hour' : 'Whitelist re-enabled', 'ok');
       await refresh();
     } catch (err) {
       toast(err.message, 'err');
@@ -590,6 +653,9 @@
   $('save-btn').addEventListener('click', save);
   $('restart-btn').addEventListener('click', restart);
   $('refresh-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));
+  $('sync-follows-btn').addEventListener('click', syncFollows);
+  $('bypass-hour-btn').addEventListener('click', () => setWhitelistBypass(60));
+  $('clear-bypass-btn').addEventListener('click', () => setWhitelistBypass(0));
   $('spawn-test-peer-btn').addEventListener('click', spawnTestPeer);
   $('refresh-test-peers-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));
 

@@ -13,6 +13,7 @@ import { createLogger } from './log.js';
 import type { Hex } from './types.js';
 
 const log = createLogger('config');
+const FOLLOW_ALLOW_FILE = 'whitelist_follows.json';
 
 export interface Config {
   /** SFU's signing key (hex secret). */
@@ -21,8 +22,24 @@ export interface Config {
   operatorPubkey: Hex | null;
   /** Pubkeys authorized to publish `start` events. Hot-swappable via SIGHUP. */
   allowedPubkeys: Set<Hex>;
+  /**
+   * Trusted referent accounts. Their latest kind-3 follows are synced into
+   * `followAllowedPubkeys`, matching the Obelisk relay whitelist model.
+   */
+  trustedReferentPubkeys: Set<Hex>;
+  /** Follow-derived allow-list from `trustedReferentPubkeys`. */
+  followAllowedPubkeys: Set<Hex>;
+  /** Public relays used to fetch kind-3 contact lists for trusted referents. */
+  followRelays: string[];
+  /** Persisted follow-derived cache path. */
+  followAllowFilePath: string;
   /** Bypass allow-list entirely (SFU_ALLOW_ALL=1). For open testing/dev use. */
   allowAll: boolean;
+  /**
+   * Temporary allow-list bypass for controlled testing. Unix seconds; null
+   * means disabled. Runtime admin writes are capped to one hour.
+   */
+  whitelistBypassUntil: number | null;
   /**
    * If true, reject `start` events whose sender is not in the allow-list
    * (or the operator), even when the event was published on a trusted-author
@@ -56,6 +73,15 @@ export interface Config {
   maxRooms: number;
   /** Drop empty rooms after this many seconds. */
   emptyGraceSeconds: number;
+  /**
+   * Hard ceiling on call duration. Every room auto-closes this many seconds
+   * after `start()` even if the host didn't set `endsAt` in rules. A host-
+   * provided `endsAt` can shorten a call (we pick the earlier of the two)
+   * but never extend past this cap. Set to 0 to disable the cap entirely
+   * — the operator panel exposes this so it can be raised/lowered at
+   * runtime without a restart.
+   */
+  maxCallDurationSeconds: number;
   /** HTTP server port (cloudflared targets this). */
   httpPort: number;
   /** Public IP override for ICE candidates (1:1 NAT). */
@@ -120,6 +146,27 @@ function readAllowFile(path: string): Hex[] {
   }
 }
 
+function readHexArrayFile(path: string, label: string): Hex[] {
+  if (!existsSync(path)) return [];
+  try {
+    const raw = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      log.warn(`${label} must be a JSON string array — ignoring`, { path });
+      return [];
+    }
+    return parsed
+      .filter((x): x is string => typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x))
+      .map((s) => s.toLowerCase());
+  } catch (err) {
+    log.warn(`failed to parse ${label} — ignoring`, {
+      path,
+      err: (err as Error).message,
+    });
+    return [];
+  }
+}
+
 /**
  * Merge env CSV + allow.json into one set. Both sources are optional;
  * the union is what the SFU actually enforces.
@@ -158,7 +205,15 @@ export function loadConfig(): Config {
   }
 
   const allowFilePath = resolve(process.cwd(), 'allow.json');
+  const followAllowFilePath = resolve(process.cwd(), FOLLOW_ALLOW_FILE);
   const allowedPubkeys = loadAllowList(allowFilePath);
+  const trustedReferentPubkeys = new Set(
+    envCsv('SFU_TRUSTED_REFERENT_PUBKEYS')
+      .filter((s) => /^[0-9a-f]{64}$/i.test(s))
+      .map((s) => s.toLowerCase()),
+  );
+  const followAllowedPubkeys = new Set(readHexArrayFile(followAllowFilePath, FOLLOW_ALLOW_FILE));
+  const followRelaysFromEnv = envCsv('SFU_FOLLOW_RELAYS');
 
   const relays = envCsv('SFU_RELAYS');
   if (relays.length === 0) {
@@ -187,7 +242,14 @@ export function loadConfig(): Config {
     nsecHex,
     operatorPubkey: envHex('SFU_OPERATOR_PUBKEY'),
     allowedPubkeys,
+    trustedReferentPubkeys,
+    followAllowedPubkeys,
+    followRelays: followRelaysFromEnv.length > 0
+      ? followRelaysFromEnv
+      : ['wss://relay.damus.io', 'wss://nos.lol', 'wss://purplepag.es'],
+    followAllowFilePath,
     allowAll: (process.env.SFU_ALLOW_ALL ?? '').trim() === '1',
+    whitelistBypassUntil: null,
     requireAllowedPubkey: (process.env.SFU_REQUIRE_ALLOWED_PUBKEY ?? '').trim() === '1',
     engine: (process.env.SFU_ENGINE ?? '').trim() === 'mediasoup' ? 'mediasoup' : 'werift',
     relays,
@@ -195,6 +257,7 @@ export function loadConfig(): Config {
     maxParticipantsPerRoom: envInt('SFU_MAX_PARTICIPANTS_PER_ROOM', 50),
     maxRooms: envInt('SFU_MAX_ROOMS', 10),
     emptyGraceSeconds: envInt('SFU_EMPTY_GRACE_SECONDS', 300),
+    maxCallDurationSeconds: envInt('SFU_MAX_CALL_DURATION_SECONDS', 3600),
     httpPort: envInt('SFU_HTTP_PORT', 4848),
     publicIp: (process.env.SFU_PUBLIC_IP ?? '').trim() || null,
     rtpPortMin,
@@ -212,10 +275,13 @@ export function loadConfig(): Config {
     relays: cfg.relays.length,
     trustedRelays: cfg.trustedAuthorRelays.length,
     allowed: cfg.allowedPubkeys.size,
+    referents: cfg.trustedReferentPubkeys.size,
+    followAllowed: cfg.followAllowedPubkeys.size,
     allowAll: cfg.allowAll,
     engine: cfg.engine,
     maxRooms: cfg.maxRooms,
     cap: cfg.maxParticipantsPerRoom,
+    maxCallDurationSeconds: cfg.maxCallDurationSeconds,
     httpPort: cfg.httpPort,
     publicUrl: cfg.publicUrl ?? '(unset)',
   });

@@ -31,11 +31,19 @@ export interface RuntimeOverrides {
   relays?: string[];
   trustedAuthorRelays?: string[];
   allowed?: string[];
+  trustedReferentPubkeys?: string[];
+  whitelistBypassUntil?: number | null;
   allowAll?: boolean;
   requireAllowedPubkey?: boolean;
   publicUrl?: string | null;
   region?: string | null;
   operatorPubkey?: string | null;
+  /**
+   * Server-wide hard cap on call duration in seconds. 0 disables the cap.
+   * Hot-reloaded — new rooms pick it up at `start()`, existing rooms get
+   * their timers rearmed via `RoomManager.rearmDurationLimits()`.
+   */
+  maxCallDurationSeconds?: number;
 }
 
 const RUNTIME_PATH = resolve(process.cwd(), 'runtime.json');
@@ -61,11 +69,25 @@ export function saveRuntimeOverrides(o: RuntimeOverrides): void {
 export function applyOverrides(cfg: Config, o: RuntimeOverrides): void {
   if (o.relays && o.relays.length > 0) cfg.relays = [...o.relays];
   if (o.trustedAuthorRelays) cfg.trustedAuthorRelays = [...o.trustedAuthorRelays];
+  if (Array.isArray(o.trustedReferentPubkeys)) {
+    cfg.trustedReferentPubkeys.clear();
+    for (const pk of o.trustedReferentPubkeys) {
+      if (/^[0-9a-f]{64}$/i.test(pk)) cfg.trustedReferentPubkeys.add(pk.toLowerCase());
+    }
+  }
+  if (o.whitelistBypassUntil !== undefined) {
+    cfg.whitelistBypassUntil = o.whitelistBypassUntil == null
+      ? null
+      : Math.floor(o.whitelistBypassUntil);
+  }
   if (o.publicUrl !== undefined) cfg.publicUrl = o.publicUrl;
   if (o.region !== undefined) cfg.region = o.region;
   if (o.operatorPubkey !== undefined) cfg.operatorPubkey = o.operatorPubkey;
   if (typeof o.allowAll === 'boolean') cfg.allowAll = o.allowAll;
   if (typeof o.requireAllowedPubkey === 'boolean') cfg.requireAllowedPubkey = o.requireAllowedPubkey;
+  if (typeof o.maxCallDurationSeconds === 'number' && Number.isFinite(o.maxCallDurationSeconds) && o.maxCallDurationSeconds >= 0) {
+    cfg.maxCallDurationSeconds = Math.floor(o.maxCallDurationSeconds);
+  }
   if (Array.isArray(o.allowed)) {
     cfg.allowedPubkeys.clear();
     for (const pk of o.allowed) {

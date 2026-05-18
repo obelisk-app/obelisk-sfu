@@ -27,7 +27,13 @@ import { KIND_SFU_ACTIVE_CALL, KIND_VOICE_SIGNAL } from './nip-kinds.js';
 import { createLogger } from './log.js';
 import { publishSfuBeacon } from './signaling.js';
 import { dispatchRequest, parseEnvelope, RpcError } from './nostr-rpc.js';
-import type { RpcContext, RpcHandlerMap, RpcNotification } from './nostr-rpc.js';
+import type {
+  RpcContext,
+  RpcHandlerMap,
+  RpcNotification,
+  RpcRequest,
+  RpcResponse,
+} from './nostr-rpc.js';
 import type { Config } from './config.js';
 import type { MediasoupEngine } from './mediasoup-server.js';
 import type { MembershipTracker } from './membership.js';
@@ -200,6 +206,13 @@ export class MediasoupRoom {
    */
   private readonly peers = new Map<string, PeerState>();
 
+  /**
+   * Direct WebSocket RPC sessions keyed by pubkey + clientId. Nostr-relay
+   * RPC stays available for older dex clients, but direct sessions get
+   * notifications immediately instead of waiting on kind 25050 relay fanout.
+   */
+  private readonly directSessions = new Map<string, Set<(notification: RpcNotification) => void>>();
+
   private signalUnsub: (() => void) | null = null;
   private membershipRelease: (() => void) | null = null;
 
@@ -221,6 +234,15 @@ export class MediasoupRoom {
    * "live call" badge in channels nobody was actually in.
    */
   private emptyTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Hard end-of-call timer. Armed in {@link start} from
+   * `min(rules.endsAt, startedAt + cfg.maxCallDurationSeconds)`; rearmed
+   * by {@link updateRules} when rules or the server cap change. Mirrors
+   * the werift Room's behavior so both engines share the "no call runs
+   * forever" guarantee — which is the main reason the SFU used to drift
+   * into stuck states that needed a manual restart.
+   */
+  private endsAtTimer: ReturnType<typeof setTimeout> | null = null;
 
   private _status: RoomStatus = 'starting';
   private startedAt = 0;
@@ -254,6 +276,17 @@ export class MediasoupRoom {
    */
   updateRules(rules: RoomRules): void {
     this._rules = rules;
+    this.scheduleEndsAt();
+  }
+
+  /**
+   * Re-arm the end-of-call timer from the current rules + server cap.
+   * Idempotent: clears any pending timer first. Called by the admin
+   * panel when `maxCallDurationSeconds` changes so an active call picks
+   * up the new ceiling without waiting for the next rules update.
+   */
+  rearmDurationLimit(): void {
+    this.scheduleEndsAt();
   }
 
   /**
@@ -554,6 +587,47 @@ export class MediasoupRoom {
     }
   }
 
+  /**
+   * Schedule the hard end-of-call close. Picks the earliest of:
+   *   - host-provided `rules.endsAt` (unix seconds)
+   *   - `startedAt + cfg.maxCallDurationSeconds` (server cap; 0 disables)
+   * Cap-disabled + no `endsAt` → no timer (legacy behavior).
+   * Pre-existing past time → close immediately.
+   */
+  private scheduleEndsAt(): void {
+    if (this.endsAtTimer) {
+      clearTimeout(this.endsAtTimer);
+      this.endsAtTimer = null;
+    }
+    if (this._status !== 'active') return;
+    const cap = this.cfg.maxCallDurationSeconds > 0
+      ? this.startedAt + this.cfg.maxCallDurationSeconds
+      : null;
+    const rulesEnd = this._rules.endsAt ?? null;
+    let endsAt: number | null;
+    if (cap == null) endsAt = rulesEnd;
+    else if (rulesEnd == null) endsAt = cap;
+    else endsAt = Math.min(rulesEnd, cap);
+    if (endsAt == null) return;
+    const ms = (endsAt - Math.floor(Date.now() / 1000)) * 1000;
+    if (ms <= 0) {
+      log.info('endsAt already past — closing', { channel: this.channelId.slice(0, 8) });
+      void this.close().catch((err) => log.warn('endsAt close threw', { err: (err as Error).message }));
+      return;
+    }
+    log.info('endsAt scheduled', {
+      channel: this.channelId.slice(0, 8),
+      endsAt,
+      inSeconds: Math.round(ms / 1000),
+      source: rulesEnd != null && (cap == null || rulesEnd < cap) ? 'rules' : 'serverCap',
+    });
+    this.endsAtTimer = setTimeout(() => {
+      log.info('endsAt reached — closing', { channel: this.channelId.slice(0, 8) });
+      void this.close().catch((err) => log.warn('endsAt close threw', { err: (err as Error).message }));
+    }, ms);
+    this.endsAtTimer.unref?.();
+  }
+
   snapshot(): RoomSnapshot {
     return {
       channelId: this.channelId,
@@ -615,6 +689,8 @@ export class MediasoupRoom {
       );
     }, REAPER_INTERVAL_MS);
 
+    this.scheduleEndsAt();
+
     log.info('room started', {
       channelId: this.channelId.slice(0, 8),
       host: this.hostPubkey.slice(0, 8),
@@ -629,6 +705,7 @@ export class MediasoupRoom {
     if (this.beaconTimer) { clearInterval(this.beaconTimer); this.beaconTimer = null; }
     if (this.activeCallTimer) { clearInterval(this.activeCallTimer); this.activeCallTimer = null; }
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    if (this.endsAtTimer) { clearTimeout(this.endsAtTimer); this.endsAtTimer = null; }
     this.cancelEmptyTimer();
     this.signalUnsub?.();
     this.signalUnsub = null;
@@ -653,6 +730,41 @@ export class MediasoupRoom {
 
   // ── envelope intake ────────────────────────────────────────────────────
 
+  registerDirectSession(
+    pubkey: Hex,
+    clientId: string,
+    send: (notification: RpcNotification) => void,
+  ): () => void {
+    const key = peerKey(pubkey, clientId);
+    let sessions = this.directSessions.get(key);
+    if (!sessions) {
+      sessions = new Set();
+      this.directSessions.set(key, sessions);
+    }
+    sessions.add(send);
+    return () => {
+      const current = this.directSessions.get(key);
+      if (!current) return;
+      current.delete(send);
+      if (current.size === 0) this.directSessions.delete(key);
+    };
+  }
+
+  async handleDirectRequest(
+    fromPubkey: Hex,
+    clientId: string,
+    req: RpcRequest,
+    notify: (method: string, data?: unknown) => Promise<void>,
+  ): Promise<RpcResponse> {
+    return this.dispatchRpcRequest(fromPubkey, clientId, req, notify);
+  }
+
+  handleDirectDisconnect(pubkey: Hex, clientId: string): void {
+    const peer = this.peers.get(peerKey(pubkey, clientId));
+    if (!peer) return;
+    this.dropStalePeer(peer, 'direct-rpc-disconnect');
+  }
+
   private async handleEnvelope(fromPubkey: Hex, content: string): Promise<void> {
     if (this._status !== 'active') return;
     const envelope = parseEnvelope(content);
@@ -667,17 +779,46 @@ export class MediasoupRoom {
       // response is from a confused legacy client. Ignore.
       return;
     }
+    // `clientId` distinguishes two devices belonging to the same Nostr
+    // pubkey. Legacy clients (pre-multi-device) don't send it; they
+    // collapse onto a single peer slot keyed by `'_legacy'` per pubkey.
+    const clientId = envelope.clientId ?? '_legacy';
+    const response = await this.dispatchRpcRequest(
+      fromPubkey,
+      clientId,
+      envelope,
+      (method, data) => this.sendNotification(fromPubkey, method, data),
+    );
+    await this.sendResponse(fromPubkey, response, envelope.method);
+  }
+
+  private async dispatchRpcRequest(
+    fromPubkey: Hex,
+    clientId: string,
+    req: RpcRequest,
+    notify: (method: string, data?: unknown) => Promise<void>,
+  ): Promise<RpcResponse> {
+    if (this._status !== 'active') {
+      return {
+        type: 'response',
+        requestId: req.requestId,
+        ok: false,
+        error: { message: 'room not active', code: 'ROOM_NOT_ACTIVE' },
+      };
+    }
+
     log.info('rpc request', {
       from: fromPubkey.slice(0, 8),
-      method: envelope.method,
-      requestId: envelope.requestId.slice(0, 8),
+      method: req.method,
+      requestId: req.requestId.slice(0, 8),
+      direct: notify !== undefined,
     });
 
     // `leave` bypasses the dial gate — a kicked or denied peer must
     // still be able to gracefully tear down their transports server-side
     // (otherwise their "you're already in this call" rejection persists
     // until ICE/DTLS times out, which is the symptom in bug #6).
-    if (envelope.method !== 'leave') {
+    if (req.method !== 'leave') {
       const decision = canDialRoom({
         rules: this._rules,
         members: this.membership.getMembers(this.channelId),
@@ -689,22 +830,22 @@ export class MediasoupRoom {
           from: fromPubkey.slice(0, 8),
           reason: decision.reason,
         });
-        return;
+        return {
+          type: 'response',
+          requestId: req.requestId,
+          ok: false,
+          error: { message: `not allowed in room: ${decision.reason}`, code: 'DIAL_REJECTED' },
+        };
       }
     }
 
-    // `clientId` distinguishes two devices belonging to the same Nostr
-    // pubkey. Legacy clients (pre-multi-device) don't send it; they
-    // collapse onto a single peer slot keyed by `'_legacy'` per pubkey.
-    const clientId = envelope.clientId ?? '_legacy';
     const ctx: RpcContext = {
       channelId: this.channelId,
       fromPubkey,
       clientId,
-      notify: (method, data) => this.sendNotification(fromPubkey, method, data),
+      notify,
     };
-    const response = await dispatchRequest(this.handlers, ctx, envelope);
-    await this.sendResponse(fromPubkey, response, envelope.method);
+    return dispatchRequest(this.handlers, ctx, req);
   }
 
   private buildResponseEvent(toPubkey: Hex, response: unknown) {
@@ -764,6 +905,12 @@ export class MediasoupRoom {
     const notification: RpcNotification = data === undefined
       ? { type: 'notification', method }
       : { type: 'notification', method, data };
+    for (const [key, sessions] of this.directSessions) {
+      if (!key.startsWith(`${toPubkey}|`)) continue;
+      for (const send of [...sessions]) {
+        try { send(notification); } catch { /* stale websocket; socket close unregisters it */ }
+      }
+    }
     const event = {
       kind: KIND_VOICE_SIGNAL,
       content: JSON.stringify(notification),

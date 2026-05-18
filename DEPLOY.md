@@ -106,13 +106,21 @@ SFU_RTP_PORT_MAX=40099
 # Capacity — start conservative; raise after stability is proven.
 SFU_MAX_PARTICIPANTS_PER_ROOM=50
 SFU_MAX_ROOMS=10
+
+# Hard ceiling on call duration (seconds). 0 disables the cap.
+# Default 1 h. The operator panel can change this live without a
+# restart, so this baseline only kicks in for fresh installs that
+# haven't written a runtime.json yet.
+SFU_MAX_CALL_DURATION_SECONDS=3600
 ```
 
 **About the trusted-relay model** (the line that matters most for production):
 
 `SFU_TRUSTED_AUTHOR_RELAYS=wss://relay.obelisk.ar` makes the relay's existing write-whitelist *the* authorization for who can start a big-room call. Anyone whitelisted on `relay.obelisk.ar` can publish a kind 25052 there; the SFU sees that delivery and treats it as authorized. **No `allow.json` to maintain on the SFU side** — the obelisk admins manage it via the relay.
 
-The local `allow.json` remains as an override (e.g. for testing without involving the relay). Keep it empty in production.
+For direct `/rpc` auth, configure `SFU_TRUSTED_REFERENT_PUBKEYS` with the same trusted accounts used by obelisk-relay. The SFU syncs their kind 3 follows from `SFU_FOLLOW_RELAYS`, persists the derived set in `whitelist_follows.json`, and allows those followed users to authenticate. The admin UI can also disable the whitelist for one hour during tests without permanently setting `SFU_ALLOW_ALL`.
+
+The local `allow.json` remains as an override (e.g. for testing without involving the relay). Keep it empty in production unless you need explicit local exceptions.
 
 ## 4. Firewall + UDP ports
 
@@ -231,6 +239,11 @@ EnvironmentFile=/opt/obelisk-dex/services/sfu/.env
 ExecStart=/usr/bin/node --enable-source-maps dist/index.js
 Restart=on-failure
 RestartSec=5
+# Cap restart velocity so a wedged config (bad relay URL, missing key,
+# port collision) doesn't restart-loop the box. After 5 failures in
+# 2 min systemd will hold the unit failed until you intervene.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 KillSignal=SIGTERM
 TimeoutStopSec=15
 StandardOutput=append:/var/log/obelisk-sfu/sfu.log

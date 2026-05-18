@@ -20,7 +20,15 @@ export function isOperator(cfg: Config, sfuPubkey: Hex, sender: Hex): boolean {
 /** Layer 2: is this pubkey in the SFU's allow-list? */
 export function isAllowedToStart(cfg: Config, sfuPubkey: Hex, sender: Hex): boolean {
   if (cfg.allowAll) return true;
-  return isOperator(cfg, sfuPubkey, sender) || cfg.allowedPubkeys.has(sender);
+  if (isWhitelistBypassActive(cfg)) return true;
+  return isOperator(cfg, sfuPubkey, sender)
+    || cfg.allowedPubkeys.has(sender)
+    || cfg.followAllowedPubkeys.has(sender);
+}
+
+export function isWhitelistBypassActive(cfg: Config): boolean {
+  return cfg.whitelistBypassUntil != null
+    && cfg.whitelistBypassUntil > Math.floor(Date.now() / 1000);
 }
 
 /**

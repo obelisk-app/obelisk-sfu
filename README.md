@@ -112,7 +112,9 @@ Critical knobs:
 | `SFU_NSEC`        | 64-char hex secret. `setup.sh` filled this in.                  |
 | `SFU_OPERATOR_PUBKEY` | Optional. The pubkey that can do anything (end calls, drain). Leave blank for "the SFU is its own operator." |
 | `SFU_RELAYS`      | Comma-separated wss:// URLs. Must include the relay your group uses for chat. |
-| `SFU_PUBLIC_URL`  | The Cloudflare tunnel hostname, e.g. `https://sfu.example.com`. Cosmetic — used in advertisements. |
+| `SFU_PUBLIC_URL`  | The Cloudflare tunnel hostname, e.g. `https://sfu.example.com`. Used for direct `/rpc` WebSocket signaling and advertised to clients. |
+| `SFU_TRUSTED_REFERENT_PUBKEYS` | Optional comma-separated referent pubkeys. Users followed by those referents are synced into the SFU allow-list. |
+| `SFU_FOLLOW_RELAYS` | Relays used to fetch trusted referent kind 3 contact lists. |
 | `SFU_PUBLIC_IP`   | If on 1:1-NAT cloud (AWS, GCP), the public IP. Otherwise leave blank. |
 | `SFU_RTP_PORT_MIN/MAX` | UDP port range for RTP (must be open on host firewall). |
 | `SFU_MAX_PARTICIPANTS_PER_ROOM` | Hard cap. Default 50.                            |

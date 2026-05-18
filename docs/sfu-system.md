@@ -203,10 +203,11 @@ There's one small client-side extension: when the SFU forwards a track from memb
 
 ## 4. Authorization model
 
-There are two authorization paths a `start` event can take:
+There are three authorization paths a `start` event or direct `/rpc` auth can take:
 
 1. **Trusted-author relay path (production default):** the event was delivered to the SFU on a relay listed in `SFU_TRUSTED_AUTHOR_RELAYS`. That relay's own write-whitelist already gated who could publish; the SFU treats every event from that relay as authorized. This is how the canonical Obelisk deployment works — the operators of `wss://relay.obelisk.ar` curate who can host big-room calls, and the SFU just listens.
 2. **Local allow-list path:** the event was delivered on an open relay (e.g. `wss://public.obelisk.ar`). The SFU falls back to checking `allow.json` (or `SFU_ALLOWED_PUBKEYS`) for the publisher's hex pubkey. Useful for solo deployments or testing.
+3. **Trusted-referent follow path:** operators configure `SFU_TRUSTED_REFERENT_PUBKEYS`; the SFU fetches each referent's latest kind 3 contact list from `SFU_FOLLOW_RELAYS`, persists the derived pubkeys in `whitelist_follows.json`, and allows those followed users to authenticate. This mirrors the obelisk-relay admin CLI model.
 
 Either path is sufficient. Combined with the four concentric trust boundaries below:
 
@@ -232,7 +233,7 @@ Either path is sufficient. Combined with the four concentric trust boundaries be
 | Layer                     | Source of truth                          | Powers                                                                        |
 |---------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | 1. **Operator**           | `SFU_OPERATOR_PUBKEY` env (optional, defaults to SFU's own keypair) | Edit allow-list, end any call, kick anyone, drain SFU.                        |
-| 2. **SFU allow-list**     | `allow.json` config file (or `SFU_ALLOWED_PUBKEYS` env CSV) | Send `start` to spin up calls. Reflected in kind 31313 advertisement.         |
+| 2. **SFU allow-list**     | `allow.json`, `SFU_ALLOWED_PUBKEYS`, or trusted-referent follows | Send `start` or authenticate to direct `/rpc`. Reflected in kind 31313 advertisement. |
 | 3. **Per-call allow-list**| `start` event params (host's choice)     | Restrict who, among NIP-29 members, can dial in for THIS call. Defaults to "all members". |
 | 4. **NIP-29 membership**  | Kind 39002 from the channel's relay      | Anyone outside this set is dropped at the SFU's signaling intake regardless of layers 1–3. |
 
@@ -246,6 +247,8 @@ admit      = member? && allowed? && !denied?
 ```
 
 If `admit` is false, the SFU silently drops the offer. (No "rejected" event — same posture as the relay.)
+
+**Temporary testing bypass.** The admin endpoint/UI can set `whitelistBypassUntil` to a future Unix timestamp capped at one hour. While active, the SFU bypasses only layer 2 so operators can test direct auth without permanently opening `allowAll`; membership and per-call room rules still apply.
 
 **Operator key default.** If `SFU_OPERATOR_PUBKEY` is unset, the SFU's own keypair is the operator. That's fine for solo deployments; for multi-admin deployments, set it to the operator's npub explicitly so they can issue control events without sharing the SFU's nsec.
 

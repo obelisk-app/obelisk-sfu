@@ -474,8 +474,16 @@ export class Room {
       clearTimeout(this.endsAtTimer);
       this.endsAtTimer = null;
     }
-    if (!this._rules.endsAt) return;
-    const ms = (this._rules.endsAt - Math.floor(Date.now() / 1000)) * 1000;
+    const cap = this.cfg.maxCallDurationSeconds > 0
+      ? this.startedAt + this.cfg.maxCallDurationSeconds
+      : null;
+    const rulesEnd = this._rules.endsAt ?? null;
+    let endsAt: number | null;
+    if (cap == null) endsAt = rulesEnd;
+    else if (rulesEnd == null) endsAt = cap;
+    else endsAt = Math.min(rulesEnd, cap);
+    if (endsAt == null) return;
+    const ms = (endsAt - Math.floor(Date.now() / 1000)) * 1000;
     if (ms <= 0) {
       void this.close().catch(() => undefined);
       return;
@@ -485,6 +493,11 @@ export class Room {
       void this.close().catch(() => undefined);
     }, ms);
     this.endsAtTimer.unref?.();
+  }
+
+  /** Re-arm the end-of-call timer; called when `cfg.maxCallDurationSeconds` changes. */
+  rearmDurationLimit(): void {
+    this.scheduleEndsAt();
   }
 
   /**
