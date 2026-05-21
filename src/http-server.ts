@@ -23,7 +23,7 @@ import type { CallListener } from './call-listener.js';
 import type { Config } from './config.js';
 import type { RelayPool } from './relay.js';
 import type { RoomManager } from './room-manager.js';
-import type { TestPeerSpawner } from './test-peer-spawner.js';
+import type { TestPeerMode, TestPeerSpawner } from './test-peer-spawner.js';
 import {
   AuthError,
   applyOverrides,
@@ -51,8 +51,7 @@ export interface HttpServerDeps {
   listener: CallListener;
   /**
    * Optional test-peer spawner — exposed at /admin/test-peer/* when present.
-   * Mediasoup-only (the spawned script needs the PlainTransport injection
-   * path that the werift engine doesn't implement).
+   * Can spawn both SFU media peers and mesh P2P peers.
    */
   testPeers: TestPeerSpawner | null;
 }
@@ -279,7 +278,7 @@ export class HttpServer {
   private handleTestPeerList(req: IncomingMessage, res: ServerResponse): void {
     if (!this.authOrFail(req, res, 'GET')) return;
     if (!this.deps.testPeers) {
-      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+      return json(res, 501, { error: 'test peer spawner is unavailable' });
     }
     json(res, 200, { peers: this.deps.testPeers.list() });
   }
@@ -287,11 +286,11 @@ export class HttpServer {
   private async handleTestPeerSpawn(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.authOrFail(req, res, 'POST')) return;
     if (!this.deps.testPeers) {
-      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+      return json(res, 501, { error: 'test peer spawner is unavailable' });
     }
     let body = '';
     for await (const chunk of req) body += chunk;
-    let data: { channelId?: string; relays?: string[] };
+    let data: { channelId?: string; relays?: string[]; mode?: TestPeerMode };
     try { data = JSON.parse(body) as typeof data; }
     catch { return json(res, 400, { error: 'invalid json' }); }
     const channelId = (data.channelId ?? '').trim().toLowerCase();
@@ -301,10 +300,17 @@ export class HttpServer {
     if (data.relays !== undefined && !Array.isArray(data.relays)) {
       return json(res, 400, { error: 'relays must be an array of ws:// or wss:// URLs' });
     }
+    const mode = data.mode ?? 'sfu';
+    if (mode !== 'sfu' && mode !== 'mesh') {
+      return json(res, 400, { error: 'mode must be sfu or mesh' });
+    }
     try {
-      const info = this.deps.testPeers.spawn(channelId, data.relays ? { relays: data.relays } : {});
+      const info = this.deps.testPeers.spawn(channelId, {
+        ...(data.relays ? { relays: data.relays } : {}),
+        mode,
+      });
       log.info('admin spawned test peer', {
-        peerId: info.peerId, channel: channelId.slice(0, 8), relays: info.relays.length,
+        peerId: info.peerId, mode: info.mode, channel: channelId.slice(0, 8), relays: info.relays.length,
       });
       json(res, 200, info);
     } catch (err) {
@@ -315,7 +321,7 @@ export class HttpServer {
   private async handleTestPeerStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.authOrFail(req, res, 'POST')) return;
     if (!this.deps.testPeers) {
-      return json(res, 501, { error: 'test peers require SFU_ENGINE=mediasoup' });
+      return json(res, 501, { error: 'test peer spawner is unavailable' });
     }
     let body = '';
     for await (const chunk of req) body += chunk;

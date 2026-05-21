@@ -10,7 +10,7 @@
  * "the SFU randomly stops working until I restart it".
  *
  * Identification is by argv signature only — both substrings come from
- * the encoder args hardcoded in `scripts/test-peers/test-peer-ms.mjs`. If
+ * the encoder args shared by the mediasoup and mesh test-peer scripts. If
  * those args change, the strings here must change in lockstep, or the
  * sweep silently does nothing.
  *

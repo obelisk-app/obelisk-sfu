@@ -19,7 +19,9 @@
     "deploy": "./scripts/sfu-deploy.sh",
     "setup": "./scripts/setup.sh",
     "generate-keys": "node scripts/generate-keys.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test-peer:sfu": "node scripts/test-peers/test-peer-ms.mjs",
+    "test-peer:mesh": "node scripts/test-peers/test-peer-mesh.mjs"
   },
   "dependencies": {
     "@noble/hashes": "^2.0.1",
