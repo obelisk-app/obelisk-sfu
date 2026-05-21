@@ -366,8 +366,14 @@ function createPeer(remotePubkey) {
   state.tx.push({ label: 'audio', sender: audioTx.sender });
   void audioTx.sender.replaceTrack(sharedAudioTrack).catch((err) => console.warn('[mesh] replace audio track failed', err.message));
 
-  pc.onnegotiationneeded = () => { void makeOffer(state, 'negotiationneeded'); };
-  setTimeout(() => { void makeOffer(state, 'initial'); }, 100);
+  pc.onnegotiationneeded = () => {
+    if (state.polite) {
+      console.log('[mesh] skip local offer to', remotePubkey.slice(0, 8), 'reason=polite-negotiationneeded');
+      return;
+    }
+    void makeOffer(state, 'negotiationneeded');
+  };
+  if (!polite) setTimeout(() => { void makeOffer(state, 'initial'); }, 100);
 
   pc.onIceCandidate.subscribe(async (candidate) => {
     if (!candidate) return;
@@ -435,8 +441,13 @@ async function handleSignal(fromPubkey, payload) {
         return;
       }
       if (offerCollision && pc.signalingState === 'have-local-offer') {
-        try { await pc.setLocalDescription({ type: 'rollback' }); }
-        catch (err) { console.warn('[mesh] rollback threw', err.message); }
+        console.log('[mesh] reset polite peer on offer glare from', fromPubkey.slice(0, 8));
+        closeControl(state);
+        try { pc.close(); } catch { /* ignore */ }
+        peers.delete(fromPubkey);
+        connectedPubkeys.delete(fromPubkey);
+        await handleSignal(fromPubkey, payload);
+        return;
       }
       await pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
       await pc.setLocalDescription();
