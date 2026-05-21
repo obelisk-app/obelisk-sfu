@@ -52,6 +52,11 @@ const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? 'obelisk';
 const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? 'obelisk';
 const FORCE_RELAY = (process.env.TEST_PEER_FORCE_RELAY ?? '1') === '1';
 const MAX_LIFETIME_SEC = Math.max(60, Number(process.env.TEST_PEER_MAX_LIFETIME_SEC) || 1800);
+const PRESENCE_TTL_SECONDS = 45;
+const BEACON_INTERVAL_MS = 10_000;
+const CONTROL_CHANNEL_LABEL = 'obelisk-control';
+const CONTROL_PING_INTERVAL_MS = 2_500;
+const CONTROL_PEER_SNAPSHOT_INTERVAL_MS = 5_000;
 
 if (RELAYS.length === 0 || RELAYS.some((r) => !/^wss?:\/\//.test(r))) {
   console.error('[mesh] TEST_PEER_RELAYS must contain ws:// or wss:// URLs');
@@ -193,6 +198,99 @@ const connectedPubkeys = new Set();
 const rosterLatest = new Map();
 const seenSignalIds = new Set();
 
+function knownPubkeys() {
+  const out = new Set();
+  for (const pk of connectedPubkeys) out.add(pk);
+  for (const pk of rosterLatest.keys()) out.add(pk);
+  for (const pk of peers.keys()) out.add(pk);
+  out.delete(pubkey);
+  return Array.from(out).sort();
+}
+
+function sendControl(state, msg) {
+  const dc = state.controlChannel;
+  if (!dc || dc.readyState !== 'open') return;
+  try { dc.send(JSON.stringify(msg)); }
+  catch (err) { console.warn('[mesh] control send failed', state.remotePubkey.slice(0, 8), err.message); }
+}
+
+function sendControlSnapshot(state) {
+  sendControl(state, { type: 'peerSnapshot', peers: knownPubkeys(), ts: Date.now() });
+}
+
+function broadcastControl(msg) {
+  for (const state of peers.values()) sendControl(state, msg);
+}
+
+function closeControl(state) {
+  if (state.controlPingTimer) { clearInterval(state.controlPingTimer); state.controlPingTimer = null; }
+  if (state.controlSnapshotTimer) { clearInterval(state.controlSnapshotTimer); state.controlSnapshotTimer = null; }
+  const dc = state.controlChannel;
+  state.controlChannel = null;
+  if (dc && dc.readyState === 'open') {
+    try { dc.close(); } catch { /* ignore */ }
+  }
+}
+
+function handleControlMessage(state, raw) {
+  let msg;
+  try {
+    const data = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
+    msg = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!msg || typeof msg.type !== 'string') return;
+  if (msg.type === 'hello' || msg.type === 'peerSnapshot') {
+    const hinted = Array.isArray(msg.peers) ? msg.peers : [];
+    for (const pk of hinted) createPeer(pk);
+  } else if (msg.type === 'peerAdded' && typeof msg.pubkey === 'string') {
+    createPeer(msg.pubkey);
+  } else if (msg.type === 'peerRemoved' && typeof msg.pubkey === 'string') {
+    // Do not tear down a direct PC from a third-party removal. The browser
+    // side uses full snapshots to decide staleness; the test peer keeps the
+    // direct connection if it already exists.
+  } else if (msg.type === 'ping') {
+    sendControl(state, { type: 'pong', ts: Date.now(), echoTs: msg.ts ?? Date.now() });
+  } else if (msg.type === 'bye') {
+    console.log('[mesh] control bye from', state.remotePubkey.slice(0, 8), msg.reason ?? 'remote-bye');
+    closeControl(state);
+    try { state.pc.close(); } catch { /* ignore */ }
+    peers.delete(state.remotePubkey);
+    connectedPubkeys.delete(state.remotePubkey);
+  }
+}
+
+function attachControlChannel(state, dc) {
+  if (!dc || dc.label !== CONTROL_CHANNEL_LABEL) return;
+  if (state.controlChannel) return;
+  state.controlChannel = dc;
+  dc.onopen = () => {
+    console.log('[mesh] control open to', state.remotePubkey.slice(0, 8));
+    sendControl(state, {
+      type: 'hello',
+      peers: knownPubkeys(),
+      sessionId: state.sessionId,
+      build: 'obelisk-mesh-test-peer',
+    });
+    state.controlPingTimer = setInterval(() => {
+      sendControl(state, { type: 'ping', ts: Date.now() });
+    }, CONTROL_PING_INTERVAL_MS);
+    state.controlSnapshotTimer = setInterval(() => {
+      sendControlSnapshot(state);
+    }, CONTROL_PEER_SNAPSHOT_INTERVAL_MS);
+    state.controlPingTimer.unref?.();
+    state.controlSnapshotTimer.unref?.();
+  };
+  dc.onmessage = (ev) => handleControlMessage(state, ev.data);
+  dc.onclose = () => {
+    console.log('[mesh] control closed to', state.remotePubkey.slice(0, 8));
+    closeControl(state);
+  };
+  dc.onerror = (ev) => console.warn('[mesh] control error to', state.remotePubkey.slice(0, 8), ev?.error?.message ?? ev?.message ?? 'error');
+  if (dc.readyState === 'open') dc.onopen?.();
+}
+
 async function sendSignal(toPubkey, payload) {
   await publish({
     kind: 25050,
@@ -247,8 +345,18 @@ function createPeer(remotePubkey) {
     sessionId: randomUUID().slice(0, 8),
     outboundSeq: 0,
     tx: [],
+    controlChannel: null,
+    controlPingTimer: null,
+    controlSnapshotTimer: null,
   };
   peers.set(remotePubkey, state);
+
+  if (!polite) {
+    try { attachControlChannel(state, pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true })); }
+    catch (err) { console.warn('[mesh] create control channel failed', err.message); }
+  }
+  pc.ondatachannel = (ev) => attachControlChannel(state, ev.channel);
+  pc.onDataChannel?.subscribe?.((channel) => attachControlChannel(state, channel));
 
   const videoTx = pc.addTransceiver('video', { direction: 'sendonly' });
   state.tx.push({ label: 'video', sender: videoTx.sender });
@@ -274,12 +382,20 @@ function createPeer(remotePubkey) {
   pc.connectionStateChange.subscribe((s) => {
     console.log('[mesh] PC ->', remotePubkey.slice(0, 8), 'connectionState=', s);
     if (s === 'connected') {
+      const isNew = !connectedPubkeys.has(remotePubkey);
       connectedPubkeys.add(remotePubkey);
+      if (isNew) broadcastControl({ type: 'peerAdded', pubkey: remotePubkey });
+      for (const other of peers.values()) sendControlSnapshot(other);
       void publishBeacon().catch(() => undefined);
     }
     if (s === 'closed' || s === 'failed' || s === 'disconnected') {
-      connectedPubkeys.delete(remotePubkey);
-      if (s === 'closed' || s === 'failed') peers.delete(remotePubkey);
+      const had = connectedPubkeys.delete(remotePubkey);
+      if (had) broadcastControl({ type: 'peerRemoved', pubkey: remotePubkey });
+      if (s === 'closed' || s === 'failed') {
+        closeControl(state);
+        peers.delete(remotePubkey);
+      }
+      for (const other of peers.values()) sendControlSnapshot(other);
       void publishBeacon().catch(() => undefined);
     }
   });
@@ -347,6 +463,7 @@ async function handleSignal(fromPubkey, payload) {
       }
     } else if (payload.type === 'requestReset') {
       console.log('[mesh] requestReset from', fromPubkey.slice(0, 8));
+      closeControl(state);
       try { pc.close(); } catch { /* ignore */ }
       peers.delete(fromPubkey);
       connectedPubkeys.delete(fromPubkey);
@@ -369,6 +486,7 @@ function pruneRoster() {
     if (!connectedPubkeys.has(pk)) {
       const peer = peers.get(pk);
       if (peer) {
+        closeControl(peer);
         try { peer.pc.close(); } catch { /* ignore */ }
         peers.delete(pk);
       }
@@ -382,18 +500,23 @@ function upsertRosterBeacon(ev) {
   if (!eventHasTag(ev, 't', 'obelisk-voice-presence')) return;
   if (eventHasTag(ev, 'sfu', '1')) return;
   const expirationTag = ev.tags.find((t) => t[0] === 'expiration')?.[1];
-  const expiresAt = expirationTag ? parseInt(expirationTag, 10) || 0 : ev.created_at + 30;
+  const expiresAt = expirationTag ? parseInt(expirationTag, 10) || 0 : ev.created_at + PRESENCE_TTL_SECONDS;
   if (!Number.isFinite(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return;
   const prev = rosterLatest.get(ev.pubkey);
   if (prev && prev.createdAt >= ev.created_at) return;
-  rosterLatest.set(ev.pubkey, { createdAt: ev.created_at, expiresAt });
+  const hintedSet = new Set();
+  for (const t of ev.tags) {
+    if ((t[0] === 'p' || t[0] === 'peer') && typeof t[1] === 'string' && t[1] && t[1] !== pubkey) {
+      hintedSet.add(t[1]);
+    }
+  }
+  const hinted = Array.from(hintedSet);
+  rosterLatest.set(ev.pubkey, { createdAt: ev.created_at, expiresAt, peers: hinted });
 
-  const hinted = ev.tags
-    .filter((t) => t[0] === 'p' && typeof t[1] === 'string' && t[1] && t[1] !== pubkey)
-    .map((t) => t[1]);
   console.log('[mesh] roster sees', ev.pubkey.slice(0, 8), hinted.length ? 'hints=' + hinted.length : '');
   createPeer(ev.pubkey);
   for (const pk of hinted) createPeer(pk);
+  for (const state of peers.values()) sendControlSnapshot(state);
 }
 
 pool.subscribe(RELAYS, {
@@ -427,16 +550,17 @@ async function publishBeacon() {
     ['t', 'obelisk-voice-presence'],
     ['client', 'obelisk-mesh-test-peer'],
     ['test-peer', 'mesh'],
-    ['expiration', String(Math.floor(Date.now() / 1000) + 30)],
+    ['expiration', String(Math.floor(Date.now() / 1000) + PRESENCE_TTL_SECONDS)],
     ['v', 'camera'],
   ];
   for (const pk of Array.from(connectedPubkeys).sort()) tags.push(['p', pk]);
+  for (const pk of knownPubkeys()) tags.push(['peer', pk]);
   await publish({ kind: 20078, content: '', tags }, 'beacon');
-  console.log('[mesh] beacon published connected=', connectedPubkeys.size);
+  console.log('[mesh] beacon published connected=', connectedPubkeys.size, 'known=', knownPubkeys().length);
 }
 await publishBeacon();
-const beaconTimer = setInterval(() => { void publishBeacon().catch(() => undefined); }, 15_000);
-const pruneTimer = setInterval(pruneRoster, 15_000);
+const beaconTimer = setInterval(() => { void publishBeacon().catch(() => undefined); }, BEACON_INTERVAL_MS);
+const pruneTimer = setInterval(pruneRoster, Math.floor(PRESENCE_TTL_SECONDS * 500));
 
 const startedAt = Date.now();
 const statsTimer = setInterval(() => {
@@ -464,8 +588,9 @@ function cleanup() {
   try { ffa.kill('SIGTERM'); } catch { /* ignore */ }
   try { videoSink.sock.close(); } catch { /* ignore */ }
   try { audioSink.sock.close(); } catch { /* ignore */ }
-  for (const { pc } of peers.values()) {
-    try { pc.close(); } catch { /* ignore */ }
+  for (const state of peers.values()) {
+    closeControl(state);
+    try { state.pc.close(); } catch { /* ignore */ }
   }
   try { pool.close(RELAYS); } catch { /* ignore */ }
   setTimeout(() => process.exit(0), 500);

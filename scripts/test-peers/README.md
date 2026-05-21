@@ -9,7 +9,7 @@ admin UI (Identity -> "Spawn test peer" button on an active room).
 |---|---|---|
 | `test-peer-ms.mjs` | mediasoup | Publishes kind 25052 `start`, then drives a `PlainTransport` via `POST /test/inject` + ffmpeg. |
 | `test-peer.mjs` | werift | Legacy: full SDP/ICE over kind 25050. Use only against the old werift SFU engine. |
-| `test-peer-mesh.mjs` | mesh P2P | Joins a regular mesh voice channel as a browser-compatible peer. It reuses the ffmpeg test pattern + sine-tone media path, publishes kind 20078 beacons, and exchanges kind 25050 SDP/ICE directly with channel peers. |
+| `test-peer-mesh.mjs` | mesh P2P | Joins a regular mesh voice channel as a browser-compatible peer. It reuses the ffmpeg test pattern + sine-tone media path, publishes kind 20078 beacons with `p`/`peer` gossip tags, exchanges kind 25050 SDP/ICE, and speaks the `obelisk-control` data channel. |
 | `start-call.mjs` | n/a | Authors a kind 25052 `start` once and exits - handy for poking the SFU manually. |
 
 Each script keeps a persistent keypair under `scripts/.test-peer*/identity.json`
@@ -61,10 +61,17 @@ See `docs/sfu-system.md` in the dex repo for the kind 25050 RPC envelope,
 kind 25052 control events, and kind 31313 advertisements. Mesh beacon
 semantics live in `docs/voice/mesh-protocol.md` in the dex repo.
 
-Mesh test peers publish kind 20078 with both diagnostic markers:
+Mesh test peers publish kind 20078 every 10 s with a 45 s expiration, connected
+peers as `p` tags, known-active peers as `peer` tags, and both diagnostic
+markers:
 
 - `["client", "obelisk-mesh-test-peer"]`
 - `["test-peer", "mesh"]`
+
+The test peer also opens/adopts the `obelisk-control` RTCDataChannel. It sends
+`hello`, periodic `peerSnapshot`, ping/pong, and incremental peer add/remove
+messages so browser peers do not tear it down for missing mesh control-plane
+traffic.
 
 The dex treats these markers as an admin-only diagnostic bypass of the NIP-29
 member gate, not as SFU discovery. Regular channel members still apply the
