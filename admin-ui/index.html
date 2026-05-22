@@ -83,8 +83,8 @@
 
   <section id="login-card" class="card" style="display:none">
     <h2>Sign in</h2>
-    <p class="muted">Authenticate with your Nostr browser extension. Only the SFU's operator pubkey is allowed.</p>
-    <button id="login-btn" class="pill pill-primary">Connect with NIP-07</button>
+    <p class="muted">Authenticate with your Nostr WoT-compatible browser signer. Only the SFU's operator pubkey is allowed.</p>
+    <button id="login-btn" class="pill pill-primary">Connect with Nostr WoT</button>
     <p id="login-err" class="err mono" style="margin-top:12px"></p>
   </section>
 
@@ -212,17 +212,19 @@
 <div id="toast"></div>
 
 <script type="importmap">
-  { "imports": { "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19" } }
+  { "imports": { "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19", "@nostr-wot/signers": "https://esm.sh/@nostr-wot/signers@0.4.0?bundle" } }
 </script>
 
 <script type="module">
   import * as nip19 from 'nostr-tools/nip19';
+  import { Nip07Signer } from '@nostr-wot/signers';
 
   const $ = (id) => document.getElementById(id);
   const log = (...a) => console.log('[admin]', ...a);
 
   let myPubkey = null;
   let snapshot = null;
+  let adminSigner = null;
 
   function toast(msg, kind) {
     const t = $('toast');
@@ -232,19 +234,25 @@
 
   function ensureNip07() {
     if (typeof window.nostr !== 'object' || !window.nostr) {
-      throw new Error('No NIP-07 extension found. Install Alby, nos2x, or similar.');
+      throw new Error('No NIP-07 extension found. Install Alby, nos2x, or a Nostr WoT-compatible signer.');
     }
   }
 
-  async function makeNip98Header(method, url) {
+  function ensureAdminSigner() {
     ensureNip07();
+    if (!adminSigner) adminSigner = new Nip07Signer();
+    return adminSigner;
+  }
+
+  async function makeNip98Header(method, url) {
+    const signer = ensureAdminSigner();
     const tmpl = {
       kind: 27235,
       created_at: Math.floor(Date.now() / 1000),
       content: '',
       tags: [['u', url], ['method', method.toUpperCase()]],
     };
-    const signed = await window.nostr.signEvent(tmpl);
+    const signed = await signer.signEvent(tmpl);
     return 'Nostr ' + btoa(JSON.stringify(signed));
   }
 
@@ -269,8 +277,8 @@
   async function login() {
     $('login-err').textContent = '';
     try {
-      ensureNip07();
-      myPubkey = await window.nostr.getPublicKey();
+      adminSigner = ensureAdminSigner();
+      myPubkey = await adminSigner.getPublicKey();
       log('logged in as', myPubkey);
       await refresh();
       $('login-card').style.display = 'none';
