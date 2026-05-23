@@ -20,10 +20,11 @@ import { fileURLToPath } from 'node:url';
 import { createLogger } from './log.js';
 import type { Advertiser } from './advertise.js';
 import type { CallListener } from './call-listener.js';
+import type { ChannelRegistry } from './channel-registry.js';
 import type { Config } from './config.js';
 import type { RelayPool } from './relay.js';
 import type { RoomManager } from './room-manager.js';
-import type { TestPeerMode, TestPeerSpawner } from './test-peer-spawner.js';
+import type { TestPeerIdentityMode, TestPeerMode, TestPeerSpawner } from './test-peer-spawner.js';
 import {
   AuthError,
   applyOverrides,
@@ -49,6 +50,8 @@ export interface HttpServerDeps {
   advertiser: Advertiser;
   /** Required for per-relay subscription status in /admin/state. */
   listener: CallListener;
+  /** Watches kind 39000 metadata so the SFU knows voice vs voice-sfu channels. */
+  channels: ChannelRegistry;
   /**
    * Optional test-peer spawner — exposed at /admin/test-peer/* when present.
    * Can spawn both SFU media peers and mesh P2P peers.
@@ -147,6 +150,12 @@ export class HttpServer {
     }
     if (url === '/rooms' || url.startsWith('/rooms?')) {
       return this.handleRooms(res);
+    }
+    if (url === '/channels/resolve' || url.startsWith('/channels/resolve?')) {
+      return this.handleChannelResolve(req, res);
+    }
+    if (url === '/channels' || url.startsWith('/channels?')) {
+      return this.handleChannels(res);
     }
     json(res, 404, { error: 'not found' });
   }
@@ -290,31 +299,64 @@ export class HttpServer {
     }
     let body = '';
     for await (const chunk of req) body += chunk;
-    let data: { channelId?: string; relays?: string[]; mode?: TestPeerMode };
+    let data: { channelId?: string; channelUrl?: string; url?: string; link?: string; relays?: string[]; mode?: TestPeerMode; identityMode?: TestPeerIdentityMode };
     try { data = JSON.parse(body) as typeof data; }
     catch { return json(res, 400, { error: 'invalid json' }); }
-    const channelId = (data.channelId ?? '').trim().toLowerCase();
-    if (!/^[0-9a-f]+$/.test(channelId)) {
-      return json(res, 400, { error: 'channelId must be hex' });
+    const parsedInput = this.parseChannelInput(data.channelId ?? data.channelUrl ?? data.url ?? data.link ?? '');
+    if (!parsedInput.channelId) {
+      return json(res, 400, { error: 'channelId, channelUrl, url, or link must contain a hex channel id' });
     }
+    const channelId = parsedInput.channelId;
     if (data.relays !== undefined && !Array.isArray(data.relays)) {
       return json(res, 400, { error: 'relays must be an array of ws:// or wss:// URLs' });
     }
-    const mode = data.mode ?? 'sfu';
+    const channel = this.deps.channels.getChannel(channelId);
+    const mode = data.mode ?? this.inferTestPeerMode(channel?.kind ?? null);
     if (mode !== 'sfu' && mode !== 'mesh') {
       return json(res, 400, { error: 'mode must be sfu or mesh' });
     }
+    if (data.identityMode !== undefined && data.identityMode !== 'ephemeral' && data.identityMode !== 'sfu') {
+      return json(res, 400, { error: 'identityMode must be ephemeral or sfu' });
+    }
     try {
+      const linkRelays = parsedInput.relay ? [parsedInput.relay] : undefined;
+      const inferredRelays = mode === 'mesh' && channel?.relays?.length ? channel.relays : undefined;
+      const relays = data.relays ?? linkRelays ?? inferredRelays;
+      const identityMode = data.identityMode ?? this.defaultTestPeerIdentityMode(mode, relays ?? []);
       const info = this.deps.testPeers.spawn(channelId, {
-        ...(data.relays ? { relays: data.relays } : {}),
+        ...(relays ? { relays } : {}),
         mode,
+        identityMode,
       });
       log.info('admin spawned test peer', {
-        peerId: info.peerId, mode: info.mode, channel: channelId.slice(0, 8), relays: info.relays.length,
+        peerId: info.peerId,
+        mode: info.mode,
+        channel: channelId.slice(0, 8),
+        relays: info.relays.length,
+        identityMode: info.identityMode,
+        channelRelays: channel?.relays?.length ?? 0,
       });
       json(res, 200, info);
     } catch (err) {
       json(res, 500, { error: (err as Error).message });
+    }
+  }
+
+  private inferTestPeerMode(channelKind: string | null): TestPeerMode {
+    return channelKind === 'voice' ? 'mesh' : 'sfu';
+  }
+
+  private defaultTestPeerIdentityMode(mode: TestPeerMode, relays: readonly string[]): TestPeerIdentityMode {
+    if (mode !== 'mesh') return 'ephemeral';
+    if (relays.length === 0) return 'ephemeral';
+    return relays.every((relay) => this.isOpenTestPeerRelay(relay)) ? 'ephemeral' : 'sfu';
+  }
+
+  private isOpenTestPeerRelay(relay: string): boolean {
+    try {
+      return new URL(relay).hostname === 'public.obelisk.ar';
+    } catch {
+      return false;
     }
   }
 
@@ -365,11 +407,14 @@ export class HttpServer {
       bootedAt: this.deps.bootedAt,
       activeRooms: this.deps.rooms.list().map((r) => ({
         channelId: r.channelId,
+        channelKind: this.deps.channels.getChannel(r.channelId)?.kind ?? 'unknown',
         status: r.status,
         participants: r.participants.length,
         host: r.hostPubkey,
         startedAt: r.startedAt,
       })),
+      channelRegistry: this.deps.channels.getStatus(),
+      voiceChannels: this.deps.channels.listVoiceChannels(),
       relayHealth,
       advertiser: this.deps.advertiser.getStatus(),
       testPeers: this.deps.testPeers ? this.deps.testPeers.list() : null,
@@ -482,6 +527,8 @@ export class HttpServer {
       region: this.deps.cfg.region,
       bootedAt: this.deps.bootedAt,
       activeRooms: this.deps.rooms.size(),
+      channelRegistry: this.deps.channels.getStatus(),
+      voiceChannels: this.deps.channels.listVoiceChannels().length,
     });
   }
 
@@ -562,6 +609,7 @@ export class HttpServer {
       <div>Engine</div><div class="mono">${escape(cfg.engine)}</div>
       <div>Capacity</div><div class="mono">${cfg.maxParticipantsPerRoom}/room · ${cfg.maxRooms} rooms</div>
       <div>Active rooms</div><div class="mono">${this.deps.rooms.size()}</div>
+      <div>Voice channels</div><div class="mono">${this.deps.channels.getStatus().voiceChannels}</div>
       <div>Uptime</div><div class="mono">${uptime}s</div>
     </div>
   </section>
@@ -579,7 +627,7 @@ export class HttpServer {
   </section>
 
   <footer>
-    Operator-run service · <a href="/info">/info</a> · <a href="/healthz">/healthz</a> · <a href="/rooms">/rooms</a>
+    Operator-run service · <a href="/info">/info</a> · <a href="/healthz">/healthz</a> · <a href="/rooms">/rooms</a> · <a href="/channels">/channels</a>
   </footer>
 </main>
 </body>
@@ -620,6 +668,8 @@ export class HttpServer {
       status: 'ok',
       uptime,
       activeRooms: this.deps.rooms.size(),
+      channelRegistry: this.deps.channels.getStatus(),
+      voiceChannels: this.deps.channels.listVoiceChannels().length,
     });
   }
 
@@ -627,12 +677,69 @@ export class HttpServer {
     // Public-safe view: don't leak participant pubkey list, just count.
     const sanitized = this.deps.rooms.list().map((r) => ({
       channelId: r.channelId,
+      channelKind: this.deps.channels.getChannel(r.channelId)?.kind ?? 'unknown',
       status: r.status,
       participants: r.participants.length,
       startedAt: r.startedAt,
       host: r.hostPubkey,
     }));
     json(res, 200, { rooms: sanitized });
+  }
+
+  private handleChannelResolve(req: IncomingMessage, res: ServerResponse): void {
+    const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+    const raw = params.get('url') ?? params.get('link') ?? params.get('channelUrl') ?? params.get('channelId') ?? params.get('c') ?? '';
+    const parsed = this.parseChannelInput(raw);
+    const relay = parsed.relay ?? this.normalizeRelayUrl(params.get('relay') ?? '');
+    if (!parsed.channelId) {
+      return json(res, 400, { error: 'url, link, channelUrl, channelId, or c must contain a hex channel id' });
+    }
+    const channel = this.deps.channels.getChannel(parsed.channelId);
+    const voiceMode = channel?.kind === 'voice' ? 'mesh' : channel?.kind === 'voice-sfu' ? 'sfu' : 'unknown';
+    json(res, 200, {
+      channelId: parsed.channelId,
+      relay,
+      channelKind: channel?.kind ?? 'unknown',
+      voiceMode,
+      testPeerMode: this.inferTestPeerMode(channel?.kind ?? null),
+      channel,
+    });
+  }
+
+  private parseChannelInput(raw: string): { channelId: string | null; relay: string | null } {
+    const value = (raw ?? '').trim();
+    if (!value) return { channelId: null, relay: null };
+    if (/^[0-9a-f]+$/i.test(value)) return { channelId: value.toLowerCase(), relay: null };
+    try {
+      const parsed = new URL(value.includes('://') ? value : 'https://obelisk.ar/' + value.replace(/^\/+/, ''));
+      const channelId = (parsed.searchParams.get('c') ?? parsed.searchParams.get('channelId') ?? parsed.searchParams.get('channel') ?? '').trim().toLowerCase();
+      const relay = this.normalizeRelayUrl(parsed.searchParams.get('relay') ?? '');
+      return { channelId: /^[0-9a-f]+$/i.test(channelId) ? channelId : null, relay };
+    } catch {
+      return { channelId: null, relay: null };
+    }
+  }
+
+  private normalizeRelayUrl(raw: string): string | null {
+    const value = (raw ?? '').trim();
+    if (!value) return null;
+    if (/^wss?:\/\//i.test(value)) return value.replace(/\/+$/, '');
+    if (/^https?:\/\//i.test(value)) {
+      try {
+        const u = new URL(value);
+        return 'wss://' + u.host + u.pathname.replace(/\/+$/, '');
+      } catch {
+        return null;
+      }
+    }
+    return 'wss://' + value.replace(/^\/+/, '').replace(/\/+$/, '');
+  }
+
+  private handleChannels(res: ServerResponse): void {
+    json(res, 200, {
+      summary: this.deps.channels.getStatus(),
+      channels: this.deps.channels.listVoiceChannels(),
+    });
   }
 }
 

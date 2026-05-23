@@ -16,7 +16,10 @@
  *   TEST_PEER_TURN_URLS         comma-separated TURN URLs.
  *   TEST_PEER_TURN_USERNAME     TURN username.
  *   TEST_PEER_TURN_CREDENTIAL   TURN credential.
- *   TEST_PEER_FORCE_RELAY       1 = TURN-only ICE, 0 = all ICE candidates.
+ *   TEST_PEER_FORCE_RELAY       1 = TURN-only ICE, 0 = all ICE candidates. Default: 0.
+ *   TEST_PEER_PUBLIC_IP         public host ICE address. Falls back to SFU_PUBLIC_IP.
+ *   TEST_PEER_RTP_PORT_MIN      ICE port range min. Falls back to SFU_RTP_PORT_MIN.
+ *   TEST_PEER_RTP_PORT_MAX      ICE port range max. Falls back to SFU_RTP_PORT_MAX.
  *   TEST_PEER_MAX_LIFETIME_SEC  hard self-exit cap, default 1800.
  */
 
@@ -27,6 +30,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import 'dotenv/config';
 import { SimplePool, finalizeEvent, getPublicKey, nip19 } from 'nostr-tools';
 import { generateSecretKey } from 'nostr-tools/pure';
 import {
@@ -38,25 +42,71 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const stateDir = path.join(__dirname, '..', '.test-peer-mesh');
 
-const CHANNEL_ID = process.argv[2];
-if (!CHANNEL_ID || !/^[0-9a-f]+$/i.test(CHANNEL_ID)) {
-  console.error('usage: node test-peer-mesh.mjs <channel-id-hex>');
-  process.exit(1);
+function normalizeRelayUrl(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return null;
+  if (/^wss?:\/\//i.test(value)) return value.replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const u = new URL(value);
+      return 'wss://' + u.host + u.pathname.replace(/\/+$/, '');
+    } catch {
+      return null;
+    }
+  }
+  return 'wss://' + value.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
-const RELAYS = (process.env.TEST_PEER_RELAYS ?? 'wss://public.obelisk.ar')
+function parseChannelArg(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return { channelId: null, relay: null };
+  if (/^[0-9a-f]+$/i.test(value)) return { channelId: value.toLowerCase(), relay: null };
+  try {
+    const parsed = new URL(value.includes('://') ? value : 'https://obelisk.ar/' + value.replace(/^\/+/, ''));
+    const channelId = (parsed.searchParams.get('c') ?? parsed.searchParams.get('channelId') ?? parsed.searchParams.get('channel') ?? '').trim().toLowerCase();
+    const relay = normalizeRelayUrl(parsed.searchParams.get('relay') ?? '');
+    return { channelId: /^[0-9a-f]+$/i.test(channelId) ? channelId : null, relay };
+  } catch {
+    return { channelId: null, relay: null };
+  }
+}
+
+const parsedChannelArg = parseChannelArg(process.argv[2]);
+const CHANNEL_ID = parsedChannelArg.channelId;
+if (!CHANNEL_ID) {
+  console.error('usage: node test-peer-mesh.mjs <channel-id-hex-or-obelisk-app-url>');
+  process.exit(1);
+}
+const DEFAULT_RELAY = parsedChannelArg.relay ?? 'wss://public.obelisk.ar';
+
+const RELAYS = (process.env.TEST_PEER_RELAYS ?? DEFAULT_RELAY)
   .split(',').map((s) => s.trim()).filter(Boolean);
 const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? 'turn:89.167.77.78:3478,turn:89.167.77.78:3478?transport=tcp')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? 'obelisk';
 const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? 'obelisk';
-const FORCE_RELAY = (process.env.TEST_PEER_FORCE_RELAY ?? '1') === '1';
+const FORCE_RELAY = (process.env.TEST_PEER_FORCE_RELAY ?? '0') === '1';
+const ICE_PUBLIC_IP = (process.env.TEST_PEER_PUBLIC_IP ?? process.env.SFU_PUBLIC_IP ?? '').trim();
+const ICE_PORT_MIN = parseOptionalPort(process.env.TEST_PEER_RTP_PORT_MIN ?? process.env.SFU_RTP_PORT_MIN);
+const ICE_PORT_MAX = parseOptionalPort(process.env.TEST_PEER_RTP_PORT_MAX ?? process.env.SFU_RTP_PORT_MAX);
+const ICE_PORT_RANGE = ICE_PORT_MIN !== null && ICE_PORT_MAX !== null && ICE_PORT_MAX > ICE_PORT_MIN
+  ? [ICE_PORT_MIN, ICE_PORT_MAX]
+  : null;
 const MAX_LIFETIME_SEC = Math.max(60, Number(process.env.TEST_PEER_MAX_LIFETIME_SEC) || 1800);
+const PUBLISH_PROFILE = (process.env.TEST_PEER_PUBLISH_PROFILE ?? '1') !== '0';
 const PRESENCE_TTL_SECONDS = 45;
 const BEACON_INTERVAL_MS = 10_000;
 const CONTROL_CHANNEL_LABEL = 'obelisk-control';
 const CONTROL_PING_INTERVAL_MS = 2_500;
 const CONTROL_PEER_SNAPSHOT_INTERVAL_MS = 5_000;
+
+function parseOptionalPort(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return null;
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+}
+
 
 if (RELAYS.length === 0 || RELAYS.some((r) => !/^wss?:\/\//.test(r))) {
   console.error('[mesh] TEST_PEER_RELAYS must contain ws:// or wss:// URLs');
@@ -95,6 +145,10 @@ console.log('[mesh] npub=', nip19.npubEncode(pubkey));
 console.log('[mesh] channel=', CHANNEL_ID);
 console.log('[mesh] relays=', RELAYS.join(','));
 console.log('[mesh] icePolicy=', FORCE_RELAY ? 'relay' : 'all');
+if (!FORCE_RELAY && ICE_PUBLIC_IP) console.log('[mesh] publicIce=', ICE_PUBLIC_IP);
+if (ICE_PORT_RANGE) {
+  console.log('[mesh] icePortRange=', ICE_PORT_RANGE[0] + '-' + ICE_PORT_RANGE[1]);
+}
 console.log('[mesh] max lifetime', MAX_LIFETIME_SEC, 's');
 
 const pool = new SimplePool({
@@ -116,18 +170,22 @@ async function publish(template, label = 'event') {
   return ev;
 }
 
-console.log('[mesh] publishing kind 0 profile...');
-await publish({
-  kind: 0,
-  content: JSON.stringify({
-    name: 'Mesh Test Peer',
-    display_name: 'Mesh Test Peer',
-    about: 'Synthetic ffmpeg mesh peer (testsrc2 + 440 Hz sine) used to smoke-test Obelisk P2P voice channels.',
-    picture: 'https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/SMPTE_Color_Bars.svg/320px-SMPTE_Color_Bars.svg.png',
-    bot: true,
-  }),
-  tags: [],
-}, 'profile');
+if (PUBLISH_PROFILE) {
+  console.log('[mesh] publishing kind 0 profile...');
+  await publish({
+    kind: 0,
+    content: JSON.stringify({
+      name: 'Mesh Test Peer',
+      display_name: 'Mesh Test Peer',
+      about: 'Synthetic ffmpeg mesh peer (testsrc2 + 440 Hz sine) used to smoke-test Obelisk P2P voice channels.',
+      picture: 'https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/SMPTE_Color_Bars.svg/320px-SMPTE_Color_Bars.svg.png',
+      bot: true,
+    }),
+    tags: [],
+  }, 'profile');
+} else {
+  console.log('[mesh] skipping kind 0 profile publish');
+}
 
 function createRtpSink(track, label) {
   return new Promise((resolve, reject) => {
@@ -225,6 +283,7 @@ function broadcastControl(msg) {
 function closeControl(state) {
   if (state.controlPingTimer) { clearInterval(state.controlPingTimer); state.controlPingTimer = null; }
   if (state.controlSnapshotTimer) { clearInterval(state.controlSnapshotTimer); state.controlSnapshotTimer = null; }
+  if (state.fallbackOfferTimer) { clearTimeout(state.fallbackOfferTimer); state.fallbackOfferTimer = null; }
   const dc = state.controlChannel;
   state.controlChannel = null;
   if (dc && dc.readyState === 'open') {
@@ -324,18 +383,24 @@ async function makeOffer(state, reason) {
   }
 }
 
-function createPeer(remotePubkey) {
+function createPeer(remotePubkey, options = {}) {
   if (!remotePubkey || remotePubkey === pubkey) return null;
   const existing = peers.get(remotePubkey);
   if (existing) return existing;
 
-  const polite = pubkey > remotePubkey;
-  console.log('[mesh] open PC to', remotePubkey.slice(0, 8), 'polite=', polite);
+  const remotePresence = rosterLatest.get(remotePubkey);
+  const remoteIsMeshTestPeer = remotePresence?.isMeshTestPeer === true;
+  const polite = options.forceImpolite ? false : (remoteIsMeshTestPeer ? pubkey > remotePubkey : true);
+  console.log('[mesh] open PC to', remotePubkey.slice(0, 8), 'polite=', polite,
+    options.forceImpolite ? '(reset-driver)' : remoteIsMeshTestPeer ? '(mesh-test-peer)' : '(browser-driven)');
 
   const pc = new RTCPeerConnection({
     iceServers: ICE_SERVERS,
     bundlePolicy: 'max-bundle',
     iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all',
+    iceUseIpv6: false,
+    ...(ICE_PORT_RANGE ? { icePortRange: ICE_PORT_RANGE } : {}),
+    ...(ICE_PUBLIC_IP && !FORCE_RELAY ? { iceAdditionalHostAddresses: [ICE_PUBLIC_IP] } : {}),
   });
   const state = {
     pc,
@@ -348,6 +413,8 @@ function createPeer(remotePubkey) {
     controlChannel: null,
     controlPingTimer: null,
     controlSnapshotTimer: null,
+    fallbackOfferTimer: null,
+    sawRemoteOffer: false,
   };
   peers.set(remotePubkey, state);
 
@@ -373,7 +440,19 @@ function createPeer(remotePubkey) {
     }
     void makeOffer(state, 'negotiationneeded');
   };
-  if (!polite) setTimeout(() => { void makeOffer(state, 'initial'); }, 100);
+  if (!polite) {
+    setTimeout(() => { void makeOffer(state, 'initial'); }, 100);
+  } else {
+    state.fallbackOfferTimer = setTimeout(() => {
+      state.fallbackOfferTimer = null;
+      if (peers.get(remotePubkey) !== state) return;
+      if (state.sawRemoteOffer) return;
+      if (pc.connectionState === 'connected' || pc.signalingState !== 'stable') return;
+      console.log('[mesh] polite fallback offer to', remotePubkey.slice(0, 8));
+      void makeOffer(state, 'polite-fallback');
+    }, 5000);
+    state.fallbackOfferTimer.unref?.();
+  }
 
   pc.onIceCandidate.subscribe(async (candidate) => {
     if (!candidate) return;
@@ -435,6 +514,8 @@ async function handleSignal(fromPubkey, payload) {
     if (payload.sessionId) state.remoteSessionId = payload.sessionId;
 
     if (payload.type === 'offer' && payload.sdp) {
+      state.sawRemoteOffer = true;
+      if (state.fallbackOfferTimer) { clearTimeout(state.fallbackOfferTimer); state.fallbackOfferTimer = null; }
       const offerCollision = state.makingOffer || pc.signalingState !== 'stable';
       if (offerCollision && !state.polite) {
         console.log('[mesh] drop colliding offer from', fromPubkey.slice(0, 8), 'state=', pc.signalingState);
@@ -472,13 +553,20 @@ async function handleSignal(fromPubkey, payload) {
         try { await pc.addIceCandidate(c); }
         catch (err) { console.warn('[mesh] addIceCandidate failed', err.message); }
       }
+    } else if (payload.type === 'bye') {
+      console.log('[mesh] relay bye from', fromPubkey.slice(0, 8), payload.byeReason ?? 'remote-bye');
+      closeControl(state);
+      try { pc.close(); } catch { /* ignore */ }
+      peers.delete(fromPubkey);
+      connectedPubkeys.delete(fromPubkey);
+      void publishBeacon().catch(() => undefined);
     } else if (payload.type === 'requestReset') {
       console.log('[mesh] requestReset from', fromPubkey.slice(0, 8));
       closeControl(state);
       try { pc.close(); } catch { /* ignore */ }
       peers.delete(fromPubkey);
       connectedPubkeys.delete(fromPubkey);
-      createPeer(fromPubkey);
+      createPeer(fromPubkey, { forceImpolite: true });
     }
   } catch (err) {
     console.warn('[mesh] handleSignal threw', err.message);
@@ -522,7 +610,9 @@ function upsertRosterBeacon(ev) {
     }
   }
   const hinted = Array.from(hintedSet);
-  rosterLatest.set(ev.pubkey, { createdAt: ev.created_at, expiresAt, peers: hinted });
+  const isMeshTestPeer = eventHasTag(ev, 'client', 'obelisk-mesh-test-peer')
+    || eventHasTag(ev, 'test-peer', 'mesh');
+  rosterLatest.set(ev.pubkey, { createdAt: ev.created_at, expiresAt, peers: hinted, isMeshTestPeer });
 
   console.log('[mesh] roster sees', ev.pubkey.slice(0, 8), hinted.length ? 'hints=' + hinted.length : '');
   createPeer(ev.pubkey);

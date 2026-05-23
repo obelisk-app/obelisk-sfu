@@ -48,13 +48,44 @@ import { generateSecretKey } from 'nostr-tools/pure';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const stateDir = path.join(__dirname, '..', '.test-peer-ms');
 
-const CHANNEL_ID = process.argv[2];
-if (!CHANNEL_ID || !/^[0-9a-f]+$/i.test(CHANNEL_ID)) {
-  console.error('usage: node test-peer-ms.mjs <channel-id-hex>');
-  process.exit(1);
+function normalizeRelayUrl(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return null;
+  if (/^wss?:\/\//i.test(value)) return value.replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const u = new URL(value);
+      return 'wss://' + u.host + u.pathname.replace(/\/+$/, '');
+    } catch {
+      return null;
+    }
+  }
+  return 'wss://' + value.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
-const RELAYS = (process.env.TEST_PEER_RELAYS ?? 'wss://public.obelisk.ar')
+function parseChannelArg(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return { channelId: null, relay: null };
+  if (/^[0-9a-f]+$/i.test(value)) return { channelId: value.toLowerCase(), relay: null };
+  try {
+    const parsed = new URL(value.includes('://') ? value : 'https://obelisk.ar/' + value.replace(/^\/+/, ''));
+    const channelId = (parsed.searchParams.get('c') ?? parsed.searchParams.get('channelId') ?? parsed.searchParams.get('channel') ?? '').trim().toLowerCase();
+    const relay = normalizeRelayUrl(parsed.searchParams.get('relay') ?? '');
+    return { channelId: /^[0-9a-f]+$/i.test(channelId) ? channelId : null, relay };
+  } catch {
+    return { channelId: null, relay: null };
+  }
+}
+
+const parsedChannelArg = parseChannelArg(process.argv[2]);
+const CHANNEL_ID = parsedChannelArg.channelId;
+if (!CHANNEL_ID) {
+  console.error('usage: node test-peer-ms.mjs <channel-id-hex-or-obelisk-app-url>');
+  process.exit(1);
+}
+const DEFAULT_RELAY = parsedChannelArg.relay ?? 'wss://public.obelisk.ar';
+
+const RELAYS = (process.env.TEST_PEER_RELAYS ?? DEFAULT_RELAY)
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Identity resolution order:

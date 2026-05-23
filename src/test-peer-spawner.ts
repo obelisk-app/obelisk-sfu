@@ -26,6 +26,7 @@ import type { Config } from './config.js';
 const log = createLogger('test-peers');
 
 export type TestPeerMode = 'sfu' | 'mesh';
+export type TestPeerIdentityMode = 'ephemeral' | 'sfu';
 
 export interface TestPeerInfo {
   peerId: string;
@@ -36,6 +37,7 @@ export interface TestPeerInfo {
   startedAt: number;
   /** Relay URLs the script was invoked with - useful for diagnostics. */
   relays: string[];
+  identityMode: TestPeerIdentityMode;
 }
 
 interface RunningPeer extends TestPeerInfo {
@@ -70,11 +72,12 @@ export class TestPeerSpawner {
   }
 
   /**
-   * Fork a synthetic test peer targeting channelId with a freshly-minted
-   * ephemeral identity. Returns immediately after spawn; the script handles
+   * Fork a synthetic test peer targeting channelId. Mesh peers normally use
+   * an ephemeral identity; whitelisted relays can ask for the SFU identity.
+   * Returns immediately after spawn; the script handles
    * discovery/media startup asynchronously.
    */
-  spawn(channelId: string, opts: { relays?: string[]; mode?: TestPeerMode } = {}): TestPeerInfo {
+  spawn(channelId: string, opts: { relays?: string[]; mode?: TestPeerMode; identityMode?: TestPeerIdentityMode } = {}): TestPeerInfo {
     if (!/^[0-9a-f]+$/i.test(channelId)) {
       throw new Error('channelId must be hex');
     }
@@ -84,8 +87,12 @@ export class TestPeerSpawner {
     }
 
     const peerId = randomBytes(8).toString('hex');
-    const skBytes = randomBytes(32);
-    const skHex = Buffer.from(skBytes).toString('hex');
+    const identityMode: TestPeerIdentityMode = mode === 'mesh'
+      ? (opts.identityMode ?? 'ephemeral')
+      : 'ephemeral';
+    const skHex = identityMode === 'sfu'
+      ? this.cfg.nsecHex
+      : Buffer.from(randomBytes(32)).toString('hex');
     const pubkey = getPublicKey(hexToBytes(skHex));
 
     const relays = (opts.relays && opts.relays.length > 0
@@ -101,6 +108,8 @@ export class TestPeerSpawner {
       TEST_PEER_NSEC_HEX: skHex,
       TEST_PEER_RELAYS: relays.join(','),
       TEST_PEER_MODE: mode,
+      TEST_PEER_IDENTITY_MODE: identityMode,
+      TEST_PEER_PUBLISH_PROFILE: identityMode === 'sfu' ? '0' : '1',
     };
 
     if (mode === 'sfu') {
@@ -118,6 +127,7 @@ export class TestPeerSpawner {
       mode,
       channelId: channelId.slice(0, 8),
       pubkey: pubkey.slice(0, 8),
+      identityMode,
       script: scriptPath,
     });
 
@@ -128,10 +138,10 @@ export class TestPeerSpawner {
     });
 
     child.stdout?.on('data', (data: Buffer) => {
-      log.debug('test peer stdout', { peerId, mode, line: data.toString().trim() });
+      this.logChildOutput('stdout', peerId, mode, data.toString());
     });
     child.stderr?.on('data', (data: Buffer) => {
-      log.debug('test peer stderr', { peerId, mode, line: data.toString().trim() });
+      this.logChildOutput('stderr', peerId, mode, data.toString());
     });
     child.on('exit', (code, signal) => {
       log.info('test peer exited', { peerId, mode, code, signal });
@@ -150,6 +160,7 @@ export class TestPeerSpawner {
       pid: child.pid ?? null,
       startedAt: Math.floor(Date.now() / 1000),
       relays,
+      identityMode,
       child,
     };
     this.peers.set(peerId, info);
@@ -186,6 +197,30 @@ export class TestPeerSpawner {
       pid: p.pid,
       startedAt: p.startedAt,
       relays: p.relays,
+      identityMode: p.identityMode,
     };
+  }
+
+  private logChildOutput(stream: 'stdout' | 'stderr', peerId: string, mode: TestPeerMode, chunk: string): void {
+    for (const rawLine of chunk.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const extra = { peerId, mode, stream, line };
+      const important = stream === 'stderr'
+        || line.includes('had rejections')
+        || line.includes('publish')
+        || line.includes('open PC')
+        || line.includes('-> offer')
+        || line.includes('-> answer')
+        || line.includes('<-')
+        || line.includes('PC ->')
+        || line.includes('status uptime')
+        || line.includes('control open');
+      if (important) {
+        log.warn('test peer output', extra);
+      } else {
+        log.debug('test peer output', extra);
+      }
+    }
   }
 }

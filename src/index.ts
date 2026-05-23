@@ -18,6 +18,7 @@
  */
 import { Advertiser } from './advertise.js';
 import { CallListener } from './call-listener.js';
+import { ChannelRegistry } from './channel-registry.js';
 import { createIdentity } from './identity.js';
 import { createLogger } from './log.js';
 import { HttpServer } from './http-server.js';
@@ -70,7 +71,8 @@ async function main(): Promise<void> {
 
   const rooms = new RoomManager(cfg, relay, membership, mediasoupEngine);
   const advertiser = new Advertiser(cfg, relay);
-  const listener = new CallListener(cfg, relay, rooms);
+  const channels = new ChannelRegistry(relay);
+  const listener = new CallListener(cfg, relay, rooms, channels);
   // Test-peer spawner supports both mediasoup and mesh modes. The mediasoup
   // script needs /test/inject, but the mesh script is pure Nostr/WebRTC.
   const testPeers = new TestPeerSpawner(cfg, identity.pubkey);
@@ -88,10 +90,12 @@ async function main(): Promise<void> {
     relay,
     advertiser,
     listener,
+    channels,
     testPeers,
   });
 
   await advertiser.start();
+  channels.start();
   listener.start();
   await http.start();
 
@@ -110,6 +114,7 @@ async function main(): Promise<void> {
 
     http.setShuttingDown();
     listener.stop();
+    channels.stop();
     advertiser.stop();
     testPeers?.stopAll();
 

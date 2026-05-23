@@ -15,6 +15,7 @@
 import type { Event } from 'nostr-tools';
 
 import { KIND_SFU_CONTROL } from './nip-kinds.js';
+import type { ChannelRegistry } from './channel-registry.js';
 import { createLogger } from './log.js';
 import { isAllowedToStart, canManageRoom, isTrustedAuthorRelay } from './auth.js';
 import type { Config } from './config.js';
@@ -70,6 +71,7 @@ export class CallListener {
     private readonly cfg: Config,
     private readonly relay: RelayPool,
     private readonly rooms: RoomManager,
+    private readonly channels: ChannelRegistry,
   ) {}
 
   start(): void {
@@ -274,6 +276,20 @@ export class CallListener {
       return;
     }
 
+    const channel = this.channels.getChannel(channelId);
+    if (channel && channel.kind !== 'voice-sfu') {
+      log.warn('start rejected: channel is not voice-sfu', {
+        channelId: channelId.slice(0, 8),
+        channelKind: channel.kind,
+      });
+      return;
+    }
+    if (!channel) {
+      log.warn('start accepted without channel metadata; registry has not seen this id yet', {
+        channelId: channelId.slice(0, 8),
+      });
+    }
+
     const rules = mergeRules(STARTING_RULES, payload.params);
 
     try {
@@ -281,6 +297,7 @@ export class CallListener {
       log.info('start accepted', {
         host: sender.slice(0, 8),
         channelId: channelId.slice(0, 8),
+        channelKind: channel?.kind ?? 'unknown',
         rules: { video: rules.video, screen: rules.screen, allow: rules.allow?.length ?? 'any' },
       });
     } catch (err) {
