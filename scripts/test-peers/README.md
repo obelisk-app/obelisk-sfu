@@ -25,6 +25,8 @@ npm run test-peer:sfu -- <channel-id-hex>
 
 # mesh P2P peer (regular voice channel, no SFU)
 npm run test-peer:mesh -- <channel-id-hex>
+# mesh P2P peer from a dex channel URL; c= and relay= are extracted
+npm run test-peer:mesh -- "https://obelisk.ar/app?s=channel&c=<channel-id-hex>&relay=public.obelisk.ar"
 ```
 
 Required env when the SFU kind 31313 advertisement is not reachable
@@ -36,12 +38,15 @@ SFU_PUBKEY=<sfu hex pubkey> SFU_URL=https://sfu.obelisk.ar TEST_PEER_RELAYS=wss:
 
 Mesh peers only need relay access and TURN settings:
 
+The mesh peer accepts either a raw channel id or a direct dex URL such as `/app?s=channel&c=...&relay=...`. When a URL is provided, it uses that channel id and converts the relay host into `wss://...` for signaling.
+
 ```bash
-TEST_PEER_RELAYS=wss://relay.obelisk.ar TEST_PEER_FORCE_RELAY=1 npm run test-peer:mesh -- <channel-id>
+TEST_PEER_RELAYS=wss://relay.obelisk.ar npm run test-peer:mesh -- <channel-id>
 ```
 
 For auth-gated relays, the peer pubkey must be whitelisted on the relay it
 publishes/subscribes through. The scripts sign NIP-42 AUTH automatically.
+Set `TEST_PEER_FORCE_RELAY=1` only when you explicitly need TURN-only ICE.
 
 ## Spawn from the admin UI
 
