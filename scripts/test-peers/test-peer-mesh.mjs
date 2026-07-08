@@ -81,10 +81,10 @@ const DEFAULT_RELAY = parsedChannelArg.relay ?? 'wss://public.obelisk.ar';
 
 const RELAYS = (process.env.TEST_PEER_RELAYS ?? DEFAULT_RELAY)
   .split(',').map((s) => s.trim()).filter(Boolean);
-const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? 'turn:89.167.77.78:3478,turn:89.167.77.78:3478?transport=tcp')
+const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? process.env.SFU_TURN_URLS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? 'obelisk';
-const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? 'obelisk';
+const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? process.env.SFU_TURN_USERNAME ?? '';
+const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? process.env.SFU_TURN_CREDENTIAL ?? '';
 const FORCE_RELAY = (process.env.TEST_PEER_FORCE_RELAY ?? '0') === '1';
 const ICE_PUBLIC_IP = (process.env.TEST_PEER_PUBLIC_IP ?? process.env.SFU_PUBLIC_IP ?? '').trim();
 const ICE_PORT_MIN = parseOptionalPort(process.env.TEST_PEER_RTP_PORT_MIN ?? process.env.SFU_RTP_PORT_MIN);

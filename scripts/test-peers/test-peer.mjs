@@ -47,10 +47,10 @@ const RELAYS = (process.env.TEST_PEER_RELAYS ?? 'wss://public.obelisk.ar')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const TRUSTED_RELAYS = (process.env.TEST_PEER_TRUSTED_RELAYS ?? 'wss://relay.obelisk.ar,wss://public.obelisk.ar')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? 'turn:89.167.77.78:3478,turn:89.167.77.78:3478?transport=tcp')
+const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? process.env.SFU_TURN_URLS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? 'obelisk';
-const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? 'obelisk';
+const TURN_USERNAME = process.env.TEST_PEER_TURN_USERNAME ?? process.env.SFU_TURN_USERNAME ?? '';
+const TURN_CREDENTIAL = process.env.TEST_PEER_TURN_CREDENTIAL ?? process.env.SFU_TURN_CREDENTIAL ?? '';
 const FORCE_RELAY = (process.env.TEST_PEER_FORCE_RELAY ?? '1') === '1';
 
 const VIDEO_RTP_PORT = 50100;
