@@ -30,7 +30,7 @@ Most important next step. Until a real browser dials in successfully and we hear
 cd services/sfu
 ./scripts/setup.sh                                  # if not already
 # Edit allow.json — add YOUR own hex pubkey (the one you'll log into obelisk-dex with)
-SFU_RELAYS=wss://relay.obelisk.ar SFU_LOG_LEVEL=debug npm run raise
+SFU_RELAYS=wss://lacrypta-relay.obelisk.ar SFU_LOG_LEVEL=debug npm run raise
 ```
 
 Then from a separate terminal, publish a `start`:
@@ -43,7 +43,7 @@ nak event --kind 25052 \
   --tag expiration="$(($(date +%s)+60))" \
   --content '{"action":"start","params":{"video":true,"screen":true}}' \
   --sec "<YOUR_NSEC>" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 Watch for:

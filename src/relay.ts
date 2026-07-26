@@ -8,7 +8,7 @@
  *
  * NIP-42 AUTH is wired through `automaticallyAuth`: when a relay sends an
  * AUTH challenge, we sign a kind 22242 event with our SFU identity and
- * push it back. Required for relays like `relay.obelisk.ar` that gate
+ * push it back. Required for relays like `lacrypta-relay.obelisk.ar` that gate
  * writes by whitelisted-pubkey-after-AUTH.
  */
 import { SimplePool, type Event, type EventTemplate, type Filter, type VerifiedEvent } from 'nostr-tools';

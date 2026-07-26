@@ -29,7 +29,7 @@ Before you SSH into the production box:
 | **Node 20 or newer** | werift requires it. |
 | **`cloudflared` installed and authenticated** (`cloudflared tunnel login`) | For the public HTTP endpoint. |
 | **A domain on Cloudflare DNS** for the tunnel hostname (e.g. `sfu.obelisk.ar`) | Where `/healthz` and the kind-31313 `url` tag point. |
-| **An Obelisk relay account on `wss://relay.obelisk.ar`** | For the trusted-author authorization (anyone whitelisted there can issue `start` events). The SFU itself does NOT need to be whitelisted on that relay — only the *users* who'll call the SFU. |
+| **An Obelisk relay account on `wss://lacrypta-relay.obelisk.ar`** | For the trusted-author authorization (anyone whitelisted there can issue `start` events). The SFU itself does NOT need to be whitelisted on that relay — only the *users* who'll call the SFU. |
 
 If any of these are missing, fix them before continuing.
 
@@ -79,13 +79,13 @@ SFU_OPERATOR_PUBKEY=
 # General relays — read+write. The dex publishes voice traffic to
 # whichever it's configured for; the canonical Obelisk default is
 # wss://public.obelisk.ar. Include any relay your group uses.
-SFU_RELAYS=wss://public.obelisk.ar
+SFU_RELAYS=wss://lacrypta-relay.obelisk.ar,wss://public.obelisk.ar
 
 # Trusted-author relays — read-only, but events seen here bypass the
 # local allow.json (the relay's write-whitelist authorizes the
 # publisher). For the canonical Obelisk deployment use the
 # permissioned relay where members are pre-whitelisted.
-SFU_TRUSTED_AUTHOR_RELAYS=wss://relay.obelisk.ar
+SFU_TRUSTED_AUTHOR_RELAYS=wss://lacrypta-relay.obelisk.ar
 
 # Public URL — the Cloudflare tunnel hostname. Cosmetic, but shows up
 # in the kind-31313 advertisement so users see "hosted by …".
@@ -116,7 +116,7 @@ SFU_MAX_CALL_DURATION_SECONDS=3600
 
 **About the trusted-relay model** (the line that matters most for production):
 
-`SFU_TRUSTED_AUTHOR_RELAYS=wss://relay.obelisk.ar` makes the relay's existing write-whitelist *the* authorization for who can start a big-room call. Anyone whitelisted on `relay.obelisk.ar` can publish a kind 25052 there; the SFU sees that delivery and treats it as authorized. **No `allow.json` to maintain on the SFU side** — the obelisk admins manage it via the relay.
+`SFU_TRUSTED_AUTHOR_RELAYS=wss://lacrypta-relay.obelisk.ar` makes the relay's existing write-whitelist *the* authorization for who can start a big-room call. Anyone whitelisted on `lacrypta-relay.obelisk.ar` can publish a kind 25052 there; the SFU sees that delivery and treats it as authorized. **No `allow.json` to maintain on the SFU side** — the obelisk admins manage it via the relay.
 
 For direct `/rpc` auth, configure `SFU_TRUSTED_REFERENT_PUBKEYS` with the same trusted accounts used by obelisk-relay. The SFU syncs their kind 3 follows from `SFU_FOLLOW_RELAYS`, persists the derived set in `whitelist_follows.json`, and allows those followed users to authenticate. The admin UI can also disable the whitelist for one hour during tests without permanently setting `SFU_ALLOW_ALL`.
 
@@ -207,7 +207,7 @@ nak req -k 31313 -a <YOUR_SFU_HEX_PUBKEY> wss://public.obelisk.ar
 # check sfu.log for "all relays rejected".
 
 # 5. Control listener is live (subscribe to kind 25052 + #p=<sfu>)
-nak req -k 25052 -p <YOUR_SFU_HEX_PUBKEY> wss://relay.obelisk.ar
+nak req -k 25052 -p <YOUR_SFU_HEX_PUBKEY> wss://lacrypta-relay.obelisk.ar
 # Expect: empty (no calls yet) but no error.
 ```
 
@@ -307,7 +307,7 @@ The tunnel still needs its own process; use systemd for that or `pm2 start --nam
 The first real test. You need:
 
 - The SFU running (see step 8).
-- A Nostr identity that's whitelisted on `wss://relay.obelisk.ar` (any obelisk member).
+- A Nostr identity that's whitelisted on `wss://lacrypta-relay.obelisk.ar` (any obelisk member).
 - A web browser to join the channel.
 - Optionally `nak` (`npm i -g nak`) to publish manually until the dex has the "Start big-room call" UI button.
 
@@ -315,7 +315,7 @@ Steps:
 
 1. **In the dex** (web UI), create a channel of type **📡 Big-room voice**, or convert an existing voice channel via channel settings → Channel type → Big-room voice → Save.
 2. **Note the channel id** — it's in the URL: `/app?c=<channelId>` or `/voice/<channelId>`.
-3. **Publish a kind 25052 `start`** to `wss://relay.obelisk.ar` (the trusted-author relay) using your whitelisted nsec:
+3. **Publish a kind 25052 `start`** to `wss://lacrypta-relay.obelisk.ar` (the trusted-author relay) using your whitelisted nsec:
 
    ```bash
    nak event \
@@ -326,12 +326,12 @@ Steps:
      --tag expiration=$(($(date +%s)+60)) \
      --content '{"action":"start","params":{"video":true,"screen":true,"maxParticipants":50}}' \
      --sec <YOUR_NSEC> \
-     wss://relay.obelisk.ar
+     wss://lacrypta-relay.obelisk.ar
    ```
 
 4. **In `sfu.log`** you should see (within ~1 s):
    ```
-   [call-listener] control received action=start from=<your8> via=wss://relay.obelisk.ar trusted=true
+   [call-listener] control received action=start from=<your8> via=wss://lacrypta-relay.obelisk.ar trusted=true
    [room] room starting channelId=<chan8> host=<your8>
    [room] room active channelId=<chan8>
    [call-listener] start accepted
@@ -420,7 +420,7 @@ For Prometheus / Datadog, scrape `/healthz` every 30 s. The activeRooms field gi
 |---|---|
 | `SFU_NSEC must be a 64-char hex secret` on boot | `.env` SFU_NSEC line is blank or non-hex. Re-run `setup.sh`. |
 | `publish: all relays rejected` for kind 31313 | The SFU's pubkey isn't whitelisted on a permissioned relay in `SFU_RELAYS`. Either whitelist it or remove that relay. |
-| `start rejected: sender not authorized` despite the user being on relay.obelisk.ar | Check `via=` in the log. If it says a non-trusted relay, the user published only to public.obelisk.ar; ensure their client is configured to also write to the trusted relay. |
+| `start rejected: sender not authorized` despite the user being on lacrypta-relay.obelisk.ar | Check `via=` in the log. If it says a non-trusted relay, the user published only to public.obelisk.ar; ensure their client is configured to also write to the trusted relay. |
 | Browser logs `topology mesh → sfu:xxx` but PC stays `new`/`failed` | UDP port range blocked. Open `40000-40099/udp` inbound. |
 | `tunnel.log` shows `Registered tunnel connection` but `/healthz` 502s | The SFU process died after the tunnel came up. Check `sfu.log` for crash. |
 | Browsers see each other in the participant list but no audio | werift offer/answer succeeded but RTP can't traverse. `SFU_PUBLIC_IP` likely unset on a 1:1-NAT host. |
@@ -432,7 +432,7 @@ When in doubt: set `SFU_LOG_LEVEL=debug`, restart, and grep `sfu.log` for the ch
 ## 12. Security notes — read before public deploy
 
 - **The SFU is a WebRTC endpoint for every peer in its rooms.** It can decrypt, record, or leak any media. Run it under your own operational control. Do NOT use someone else's SFU you don't trust.
-- **Trusted-author relays delegate authorization to the relay operator.** If `relay.obelisk.ar` whitelists a hostile pubkey, that pubkey can spin up calls on your SFU. Keep your trust transitive — only list relays you operate or fully trust.
+- **Trusted-author relays delegate authorization to the relay operator.** If `lacrypta-relay.obelisk.ar` whitelists a hostile pubkey, that pubkey can spin up calls on your SFU. Keep your trust transitive — only list relays you operate or fully trust.
 - **`allow.json` is committed to the repo's gitignore** but `setup.sh` writes a placeholder. Put real allow-list contents only in your deploy-host copy; never commit pubkeys you intend to keep curated.
 - **The SFU's `nsec` lives in `.env`.** Permissions on the file should be `600`, owned by the service user.
 - **Public STUN only** in v0. If you have users behind symmetric NAT, configure `SFU_TURN_*` with your own coturn or rent one (Twilio, Xirsys).

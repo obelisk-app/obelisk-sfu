@@ -20,6 +20,7 @@
     "setup": "./scripts/setup.sh",
     "generate-keys": "node scripts/generate-keys.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node --test scripts/test-peers/*.test.mjs",
     "test-peer:sfu": "node scripts/test-peers/test-peer-ms.mjs",
     "test-peer:mesh": "node scripts/test-peers/test-peer-mesh.mjs"
   },

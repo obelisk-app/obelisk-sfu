@@ -41,7 +41,7 @@ import { fileURLToPath } from 'node:url';
 import { SimplePool, finalizeEvent, getPublicKey, nip19 } from 'nostr-tools';
 import { generateSecretKey } from 'nostr-tools/pure';
 
-// NIP-42 AUTH support — relay.obelisk.ar gates reads + writes on
+// NIP-42 AUTH support — lacrypta-relay.obelisk.ar gates reads + writes on
 // authenticated whitelisted pubkeys; without this the discovery sub
 // gets rejected with "Auth required" and the script loops forever.
 
