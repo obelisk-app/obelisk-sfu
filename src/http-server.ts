@@ -5,9 +5,9 @@
  *   GET /healthz   — 200 OK with uptime; 503 if shutting down.
  *   GET /rooms     — sanitized list of active rooms (channel id, count, status).
  *
- * This is what the Cloudflare tunnel exposes. The tunnel is cosmetic —
- * call control happens over Nostr — but it gives operators a public
- * URL for monitoring and clients a verifiable identity endpoint.
+ * This is what the Cloudflare tunnel exposes. Clients verify `/info` and
+ * use the authenticated `/rpc` WebSocket; Nostr remains the discovery and
+ * backward-compatible signaling path.
  *
  * No auth on these endpoints. They expose nothing the relay doesn't
  * already serve via kind 31313 / 31314.
@@ -750,6 +750,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
   });
   res.end(payload);
 }

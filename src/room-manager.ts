@@ -4,7 +4,6 @@
  * Node main thread, so plain Map mutation is safe — no locks needed.
  */
 import { createLogger } from './log.js';
-import { Room } from './room.js';
 import { MediasoupRoom } from './room-mediasoup.js';
 import type { Config } from './config.js';
 import type { MediasoupEngine } from './mediasoup-server.js';
@@ -28,23 +27,19 @@ export interface RoomLike {
   kick(targetPubkey: Hex, reason?: string): Promise<void>;
   /** Replace room rules in-place. Re-sends to active peers if their consent changed. */
   updateRules(rules: RoomRules): void;
-  /**
-   * Direct SFU signaling path. Mediasoup rooms support the same RPC envelope
-   * as kind 25050, but over the SFU's authenticated WebSocket. Legacy werift
-   * rooms omit these hooks.
-   */
-  registerDirectSession?(
+  /** Direct mediasoup RPC over the authenticated SFU WebSocket. */
+  registerDirectSession(
     pubkey: Hex,
     clientId: string,
     send: (notification: RpcNotification) => void,
   ): () => void;
-  handleDirectRequest?(
+  handleDirectRequest(
     fromPubkey: Hex,
     clientId: string,
     req: RpcRequest,
     notify: (method: string, data?: unknown) => Promise<void>,
   ): Promise<RpcResponse>;
-  handleDirectDisconnect?(pubkey: Hex, clientId: string): void;
+  handleDirectDisconnect(pubkey: Hex, clientId: string): void;
   /**
    * Re-evaluate the call-duration timer from the (possibly-changed)
    * `cfg.maxCallDurationSeconds`. The admin panel calls this on every
@@ -63,9 +58,7 @@ export class RoomManager {
     private readonly membership: MembershipTracker,
     private readonly engine: MediasoupEngine | null,
   ) {
-    if (cfg.engine === 'mediasoup' && !engine) {
-      throw new Error('RoomManager: SFU_ENGINE=mediasoup requires the mediasoup engine to be passed in');
-    }
+    if (!engine) throw new Error('RoomManager requires a mediasoup engine');
   }
 
   size(): number {
@@ -84,26 +77,16 @@ export class RoomManager {
     if (this.rooms.has(channelId)) {
       throw new Error(`room already active for channel ${channelId}`);
     }
-    const room: RoomLike = this.cfg.engine === 'mediasoup'
-      ? new MediasoupRoom({
-          channelId,
-          hostPubkey,
-          rules,
-          cfg: this.cfg,
-          engine: this.engine!,
-          relay: this.relay,
-          membership: this.membership,
-          onClosed: (id) => this.rooms.delete(id),
-        })
-      : new Room({
-          channelId,
-          hostPubkey,
-          rules,
-          cfg: this.cfg,
-          relay: this.relay,
-          membership: this.membership,
-          onClosed: (id) => this.rooms.delete(id),
-        });
+    const room: RoomLike = new MediasoupRoom({
+      channelId,
+      hostPubkey,
+      rules,
+      cfg: this.cfg,
+      engine: this.engine!,
+      relay: this.relay,
+      membership: this.membership,
+      onClosed: (id) => this.rooms.delete(id),
+    });
     this.rooms.set(channelId, room);
     try {
       await room.start();

@@ -2,10 +2,10 @@
   "name": "obelisk-sfu",
   "version": "0.1.0",
   "private": true,
-  "description": "Obelisk SFU — Nostr-signaled WebRTC selective forwarding unit (mediasoup). See docs/sfu-system.md.",
+  "description": "Obelisk SFU — Nostr-identified mediasoup selective forwarding service. See docs/sfu-system.md.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "main": "dist/index.js",
   "bin": {
@@ -25,15 +25,15 @@
     "test-peer:mesh": "node scripts/test-peers/test-peer-mesh.mjs"
   },
   "dependencies": {
-    "@noble/hashes": "^2.0.1",
-    "dotenv": "^16.4.5",
-    "mediasoup": "^3.19.22",
-    "nostr-tools": "^2.23.3",
-    "werift": "^0.22.4"
+    "@noble/hashes": "^2.2.0",
+    "dotenv": "^17.4.2",
+    "mediasoup": "^3.22.0",
+    "nostr-tools": "^2.24.1"
   },
   "devDependencies": {
-    "@types/node": "^20.12.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3",
+    "werift": "^0.24.1"
   }
 }

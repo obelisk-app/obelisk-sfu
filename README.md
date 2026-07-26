@@ -1,6 +1,6 @@
 # Obelisk SFU — operator runbook
 
-Standalone Node service that acts as an opt-in SFU (selective forwarding unit) for Obelisk voice channels. It speaks the same Nostr signaling wire as mesh calls (kinds 20078 + 25050), advertises itself on Nostr (kind 31313), and accepts call-control events (kind 25052) from a hand-picked allow-list of pubkeys.
+Standalone Node 22+ mediasoup service for Obelisk `voice-sfu` channels. Browsers authenticate with signed Nostr identities over the direct `/rpc` WebSocket; Nostr kinds 30078/31313 select the operator and kind 25050 remains a compatibility fallback.
 
 <p>
   <a href="https://github.com/obelisk-app/obelisk-sfu/stargazers"><img src="https://img.shields.io/github/stars/obelisk-app/obelisk-sfu?style=flat&logo=github&color=b4f953&labelColor=0a0a0a" alt="GitHub stars" /></a>
@@ -13,7 +13,7 @@ Standalone Node service that acts as an opt-in SFU (selective forwarding unit) f
 
 This README is the day-to-day operator runbook: dev setup, log greps, nak recipes.
 
-> **v0.** Audio forwarding works at small scale. Production hardening punch-list is in [docs/sfu-system.md §10](docs/sfu-system.md#10-whats-not-in-v0-production-hardening-punch-list).
+> Current architecture and wire contracts are in [docs/sfu-system.md](docs/sfu-system.md).
 
 ## The Obelisk family
 
@@ -46,13 +46,13 @@ cloudflared tunnel route dns --overwrite-dns obelisk-sfu sfu.example.com
 npm run raise                   # SFU + tunnel attached to your terminal
 ```
 
-The SFU publishes its kind 31313 advertisement immediately and starts listening for kind 25052 control events from anyone in your allow-list.
+The SFU publishes kind 31313 discovery, exposes `/info`, and accepts allow-listed signed callers on `/rpc`.
 
 ---
 
 ## What you need
 
-- **Node 20+** and **npm**.
+- **Node 22+** and **npm**.
 - **A public IP** for the host (or 1:1 NAT with `SFU_PUBLIC_IP` set; or UDP port forwarding through a home router).
 - **UDP `40000-40099` open inbound** (configurable). RTP media flows over these ports — straight from the SFU to clients, NOT through Cloudflare.
 - **`cloudflared`** installed and authenticated (`brew install cloudflared && cloudflared tunnel login`). Optional if you set `SKIP_TUNNEL=1`, but you lose the public `/healthz` endpoint.
@@ -62,7 +62,7 @@ The SFU publishes its kind 31313 advertisement immediately and starts listening 
 
 ```
 services/sfu/
-├── package.json              own deps — werift, nostr-tools, dotenv
+├── package.json              mediasoup + Nostr runtime dependencies
 ├── tsconfig.json
 ├── .env                      created by setup.sh (gitignored)
 ├── .env.example              the documented set of knobs
@@ -84,7 +84,7 @@ cd services/sfu
 ```
 
 The script:
-- checks Node ≥ 20 (`werift` won't build on older)
+- checks Node ≥ 22 (required by current mediasoup)
 - runs `npm install`
 - copies `.env.example` → `.env` if missing
 - runs `node scripts/generate-keys.mjs --write` if `SFU_NSEC` is blank
@@ -236,7 +236,7 @@ Then check the relay for the kind 31314 active-call event:
 nak req -k 31314 -d "$CHANNEL_ID" wss://lacrypta-relay.obelisk.ar
 ```
 
-Once that's up, mesh-aware Obelisk clients in the channel will see the SFU's `["sfu","1"]` beacon. Connecting clients (after the planned client-side topology switch lands) dial only the SFU.
+Once that is up, current Obelisk clients resolve the channel pin and connect directly to the SFU `/rpc` endpoint.
 
 ## Day-2 operations
 
@@ -256,8 +256,8 @@ Shows whether the SFU process and tunnel are up.
 
 Or just Ctrl-C the foreground `npm run raise`. Either way, the SFU traps SIGTERM and:
 - publishes `kind 31314 status=closed` for every active room
-- sends `bye` (kind 25050) to every connected peer
-- closes WebRTC PCs cleanly
+- notifies connected direct-RPC sessions
+- closes mediasoup transports, routers, and workers cleanly
 
 ### Reload allow-list
 
@@ -341,31 +341,22 @@ tail -f sfu.log | grep WARN                 # things to investigate
 | Advertisement never appears on the relay       | Wrong `SFU_RELAYS` URL, or the relay drops kind 31313 (NIP-78-adjacent — unlikely). |
 | `start` event posted but no kind 31314         | Sender isn't in `allow.json` (check log for `start rejected`).    |
 | Kind 31314 published but peers never connect   | `SFU_PUBLIC_IP` unset on a 1:1-NAT host → ICE candidates only have private IP. |
-| Peers connect but no audio                     | `werift` package didn't install cleanly (rare on Node 20+); reinstall.  |
+| Peers connect but no audio                     | Verify the mediasoup announced IP and RTP firewall range. |
 | `/healthz` 503                                 | Service is shutting down — wait or restart.                       |
 | All peers fail with same NAT type              | Symmetric NAT both sides. Add a TURN: set `SFU_TURN_*`.           |
 
-## What's wired vs what's pending
+## Current capabilities
 
-**Wired:**
-- ✅ Nostr identity, advertisement publishing + refresh, allow-list config (file + env)
-- ✅ Kind 25052 control listener with allow-list / operator / host gates
-- ✅ NIP-29 admin/member tracking per active call
-- ✅ Kind 31314 active-call publishing + heartbeat + closed marker
-- ✅ Kind 20078 SFU presence beacon with `["sfu","1"]` topology marker
-- ✅ Kind 25050 SDP/ICE per-peer transport mirroring mesh
-- ✅ Perfect-negotiation glare resolution (polite by lex pubkey)
-- ✅ HTTP `/`, `/healthz`, `/rooms` endpoints
-- ✅ SIGHUP allow-list reload, SIGUSR1 drain, SIGTERM clean shutdown
-- ✅ Cloudflare tunnel raise/stop/status script
+- ✅ mediasoup worker/router media forwarding for audio, camera, and screen
+- ✅ direct authenticated WebSocket RPC with signed Nostr identity
+- ✅ URL-only channel pins verified through CORS-enabled `/info`
+- ✅ local allow-list, trusted-referent follows, operator gates, and explicit 4403 rejection
+- ✅ kind 31313 discovery and kind 31314 active-room status
+- ✅ kind 25052/25050 compatibility for older clients and SFUs
+- ✅ participant roster, multi-device IDs, reconnect/consumer watchdogs
+- ✅ operator admin UI, health checks, drain, restart, and synthetic test peers
 
-**Pending — see [docs/sfu-system.md §10](docs/sfu-system.md#10-whats-not-in-v0-production-hardening-punch-list):**
-- ⏳ Client-side topology switch (`dialOnly`, `originPubkey` plumbing in obelisk-dex)
-- ⏳ Tests (`vitest` setup mirroring `src/lib/voice/`)
-- ⏳ Mediasoup migration for native packet pass-through
-- ⏳ Reconnect ladder (currently drops on `failed` and waits for redial)
-- ⏳ Encrypted signaling (gift-wrap upgrade — paired with mesh upgrade)
-- ⏳ Recording, simulcast, federation
+Future features such as recording or federation stay out until they have a concrete product requirement.
 
 ## Trust model — read this once
 

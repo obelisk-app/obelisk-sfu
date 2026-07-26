@@ -26,8 +26,8 @@ step "Pre-flight"
 command -v node >/dev/null || { red "node not installed."; exit 1; }
 command -v npm  >/dev/null || { red "npm not installed."; exit 1; }
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 20 ]; then
-  red "Node 20+ required (found v$(node -v))."
+if [ "$NODE_MAJOR" -lt 22 ]; then
+  red "Node 22+ required (found v$(node -v))."
   exit 1
 fi
 green "node $(node -v)  npm $(npm -v)"

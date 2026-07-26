@@ -179,10 +179,6 @@ function handleUpgrade(
         }
         room = await deps.rooms.start(channelId, verifiedPubkey, DEFAULT_RULES);
       }
-      if (!room.handleDirectRequest || !room.registerDirectSession) {
-        closeWith(4400, 'direct rpc unsupported by engine');
-        return;
-      }
       pubkey = verifiedPubkey;
       clientId = authClientId;
       unregisterDirect = room.registerDirectSession(pubkey, clientId, (notification) => {

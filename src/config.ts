@@ -50,13 +50,8 @@ export interface Config {
    * went open). The flag is the belt to the relay's suspenders.
    */
   requireAllowedPubkey: boolean;
-  /**
-   * Media engine: legacy `werift` (single-process JS, ≤10 receivers per
-   * room) or `mediasoup` (C++ worker per CPU core, simulcast, hundreds
-   * of receivers). Default `werift` until mediasoup parity ships and we
-   * remove the werift code paths entirely. See docs/sfu-mediasoup-migration.md.
-   */
-  engine: 'werift' | 'mediasoup';
+  /** Production media engine. Legacy Werift remains test-tooling only. */
+  engine: 'mediasoup';
   /** Relays the SFU subscribes/publishes to. */
   relays: string[];
   /**
@@ -251,7 +246,7 @@ export function loadConfig(): Config {
     allowAll: (process.env.SFU_ALLOW_ALL ?? '').trim() === '1',
     whitelistBypassUntil: null,
     requireAllowedPubkey: (process.env.SFU_REQUIRE_ALLOWED_PUBKEY ?? '').trim() === '1',
-    engine: (process.env.SFU_ENGINE ?? '').trim() === 'mediasoup' ? 'mediasoup' : 'werift',
+    engine: 'mediasoup',
     relays,
     trustedAuthorRelays,
     maxParticipantsPerRoom: envInt('SFU_MAX_PARTICIPANTS_PER_ROOM', 50),

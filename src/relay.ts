@@ -176,11 +176,8 @@ export class RelayPool {
     const sub = this.pool.subscribeMany(allRelays, filter, {
       onevent: onEvent,
       onauth: this.signAuthChallenge,
-      onclose: (reasons: string[]) => {
-        reasons.forEach((reason, i) => {
-          const relayUrl = allRelays[i];
-          if (relayUrl) this.recordSubscribeClose(relayUrl, reason);
-        });
+      onclose: (reasons) => {
+        for (const { url, reason } of reasons) this.recordSubscribeClose(url, reason);
       },
       ...(onEose ? { oneose: onEose } : {}),
     });
@@ -264,8 +261,9 @@ export class RelayPool {
       oneose: () => {
         this.lastEventAt.set(url, Math.floor(Date.now() / 1000));
       },
-      onclose: (reasons: string[]) => {
-        this.recordSubscribeClose(url, reasons[0] ?? 'subscription closed');
+      onclose: (reasons) => {
+        const closed = reasons.find((item) => item.url === url) ?? reasons[0];
+        this.recordSubscribeClose(url, closed?.reason ?? 'subscription closed');
       },
       onauth: this.signAuthChallenge,
     });

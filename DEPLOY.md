@@ -11,7 +11,7 @@ End-to-end procedure to bring up the SFU on a production host. Targets a deploym
 A standalone Node service (`services/sfu/`) that:
 
 - Speaks Nostr (kind 31313 advertise + 25052 control + 31314 active-call + 20078 + 25050 — see [`docs/sfu-system.md`](../../docs/sfu-system.md)).
-- Runs WebRTC server-side via [werift](https://github.com/shinyoshiaki/werift-webrtc), forwarding audio/video between participants (Selective Forwarding Unit).
+- Runs the current [mediasoup](https://github.com/versatica/mediasoup) worker/router for audio, video, and screen forwarding.
 - Exposes a tiny HTTP server (`/`, `/healthz`, `/rooms`) for monitoring; this is what the Cloudflare tunnel exposes publicly.
 - **Does NOT carry media through the tunnel.** Media flows directly UDP browser↔SFU. The tunnel is cosmetic + monitoring.
 
@@ -26,7 +26,7 @@ Before you SSH into the production box:
 | **A box with a public IP** (or 1:1 NAT with the public IP known) | WebRTC media uses UDP direct to the SFU. Cloudflare tunnels do NOT carry media. |
 | **Inbound UDP `40000-40099` open in the firewall** (range configurable) | RTP packets come in on these ports. Default is 100 ports (~10 simultaneous rooms). |
 | **Outbound TCP/443 open** | For Nostr WebSocket relays + STUN. |
-| **Node 20 or newer** | werift requires it. |
+| **Node 22 or newer** | Required by the current mediasoup release. |
 | **`cloudflared` installed and authenticated** (`cloudflared tunnel login`) | For the public HTTP endpoint. |
 | **A domain on Cloudflare DNS** for the tunnel hostname (e.g. `sfu.obelisk.ar`) | Where `/healthz` and the kind-31313 `url` tag point. |
 | **An Obelisk relay account on `wss://lacrypta-relay.obelisk.ar`** | For the trusted-author authorization (anyone whitelisted there can issue `start` events). The SFU itself does NOT need to be whitelisted on that relay — only the *users* who'll call the SFU. |
@@ -54,7 +54,7 @@ Run the first-time setup script:
 ```
 
 It does:
-1. Verifies Node ≥ 20 + npm.
+1. Verifies Node ≥ 22 + npm.
 2. `npm install` (~1 minute first time).
 3. Copies `.env.example` → `.env` if missing.
 4. Generates a fresh `SFU_NSEC` and patches it into `.env`.
@@ -423,8 +423,8 @@ For Prometheus / Datadog, scrape `/healthz` every 30 s. The activeRooms field gi
 | `start rejected: sender not authorized` despite the user being on lacrypta-relay.obelisk.ar | Check `via=` in the log. If it says a non-trusted relay, the user published only to public.obelisk.ar; ensure their client is configured to also write to the trusted relay. |
 | Browser logs `topology mesh → sfu:xxx` but PC stays `new`/`failed` | UDP port range blocked. Open `40000-40099/udp` inbound. |
 | `tunnel.log` shows `Registered tunnel connection` but `/healthz` 502s | The SFU process died after the tunnel came up. Check `sfu.log` for crash. |
-| Browsers see each other in the participant list but no audio | werift offer/answer succeeded but RTP can't traverse. `SFU_PUBLIC_IP` likely unset on a 1:1-NAT host. |
-| Calls work but audio is choppy | CPU saturated. werift transcodes per receiver; with N=20+ start watching `top` and consider mediasoup migration (post-v0). |
+| Browsers see each other in the participant list but no audio | Direct RPC succeeded but RTP cannot traverse. Verify `SFU_PUBLIC_IP` and the RTP port range. |
+| Calls work but audio is choppy | Check mediasoup worker CPU, consumer stats, and host/network saturation. |
 | `requestReset → closing for redial` repeats | Browser keeps hitting its 8 s polite watchdog because the SFU's offer never arrives. Check for relay filtering or SDP rejection in the browser console. |
 
 When in doubt: set `SFU_LOG_LEVEL=debug`, restart, and grep `sfu.log` for the channel's 8-char prefix. Every event involving that room is tagged with it.
@@ -460,4 +460,4 @@ The SFU is stateless across restarts (room state is reconstructed from kind 2505
 - [`README.md`](README.md) — operator runbook (day-1 commands, log greps, nak recipes).
 - [`HANDOFF.md`](HANDOFF.md) — punch list of post-v0 work (mediasoup, encrypted signaling, tests, etc).
 - [`docs/voice-system.md`](../../docs/voice-system.md) — the mesh client this integrates with.
-- werift's source: [github.com/shinyoshiaki/werift-webrtc](https://github.com/shinyoshiaki/werift-webrtc).
+- mediasoup source: [github.com/versatica/mediasoup](https://github.com/versatica/mediasoup).

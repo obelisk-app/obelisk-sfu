@@ -62,12 +62,7 @@ async function main(): Promise<void> {
   const relay = new RelayPool(cfg.relays, identity, cfg.trustedAuthorRelays);
   const membership = new MembershipTracker(relay);
 
-  // mediasoup engine: only spun up when SFU_ENGINE=mediasoup. The werift
-  // path keeps zero native dependencies for backward compat.
-  let mediasoupEngine: MediasoupEngine | null = null;
-  if (cfg.engine === 'mediasoup') {
-    mediasoupEngine = await createMediasoupEngine(cfg);
-  }
+  const mediasoupEngine: MediasoupEngine = await createMediasoupEngine(cfg);
 
   const rooms = new RoomManager(cfg, relay, membership, mediasoupEngine);
   const advertiser = new Advertiser(cfg, relay);
