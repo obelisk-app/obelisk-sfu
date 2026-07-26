@@ -77,6 +77,9 @@ Mesh SDP and ICE use the browser's current kind 25050 envelope:
 `{"type":"peer","peerSignal":<simple-peer signal>}`. The diagnostic peer
 still accepts the legacy top-level `offer`, `answer`, and `ice` shapes.
 
+Inbound signals are applied serially, and answers are published before werift
+starts ICE gathering so Chromium never receives ICE before its remote SDP.
+
 The test peer also opens/adopts the `obelisk-control` RTCDataChannel. It sends
 `hello`, periodic `peerSnapshot`, ping/pong, and incremental peer add/remove
 messages so browser peers do not tear it down for missing mesh control-plane

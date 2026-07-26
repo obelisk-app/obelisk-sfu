@@ -284,7 +284,6 @@ function broadcastControl(msg) {
 function closeControl(state) {
   if (state.controlPingTimer) { clearInterval(state.controlPingTimer); state.controlPingTimer = null; }
   if (state.controlSnapshotTimer) { clearInterval(state.controlSnapshotTimer); state.controlSnapshotTimer = null; }
-  if (state.fallbackOfferTimer) { clearTimeout(state.fallbackOfferTimer); state.fallbackOfferTimer = null; }
   const dc = state.controlChannel;
   state.controlChannel = null;
   if (dc && dc.readyState === 'open') {
@@ -410,12 +409,11 @@ function createPeer(remotePubkey, options = {}) {
     makingOffer: false,
     sessionId: randomUUID().slice(0, 8),
     outboundSeq: 0,
+    signalQueue: Promise.resolve(),
     tx: [],
     controlChannel: null,
     controlPingTimer: null,
     controlSnapshotTimer: null,
-    fallbackOfferTimer: null,
-    sawRemoteOffer: false,
   };
   peers.set(remotePubkey, state);
 
@@ -443,16 +441,6 @@ function createPeer(remotePubkey, options = {}) {
   };
   if (!polite) {
     setTimeout(() => { void makeOffer(state, 'initial'); }, 100);
-  } else {
-    state.fallbackOfferTimer = setTimeout(() => {
-      state.fallbackOfferTimer = null;
-      if (peers.get(remotePubkey) !== state) return;
-      if (state.sawRemoteOffer) return;
-      if (pc.connectionState === 'connected' || pc.signalingState !== 'stable') return;
-      console.log('[mesh] polite fallback offer to', remotePubkey.slice(0, 8));
-      void makeOffer(state, 'polite-fallback');
-    }, 5000);
-    state.fallbackOfferTimer.unref?.();
   }
 
   pc.onIceCandidate.subscribe(async (candidate) => {
@@ -512,13 +500,15 @@ async function handleSignal(fromPubkey, payload) {
   if (!payload) return;
   const state = createPeer(fromPubkey);
   if (!state) return;
+  const previousSignal = state.signalQueue;
+  let releaseSignal = () => {};
+  state.signalQueue = new Promise((resolve) => { releaseSignal = resolve; });
+  await previousSignal;
   const { pc } = state;
   try {
     if (payload.sessionId) state.remoteSessionId = payload.sessionId;
 
     if (payload.type === 'offer' && payload.sdp) {
-      state.sawRemoteOffer = true;
-      if (state.fallbackOfferTimer) { clearTimeout(state.fallbackOfferTimer); state.fallbackOfferTimer = null; }
       const offerCollision = state.makingOffer || pc.signalingState !== 'stable';
       if (offerCollision && !state.polite) {
         console.log('[mesh] drop colliding offer from', fromPubkey.slice(0, 8), 'state=', pc.signalingState);
@@ -534,16 +524,15 @@ async function handleSignal(fromPubkey, payload) {
         return;
       }
       await pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
-      await pc.setLocalDescription();
-      if (pc.localDescription) {
-        console.log('[mesh] -> answer to', fromPubkey.slice(0, 8), 'sdp=', pc.localDescription.sdp.length);
-        await sendSignal(fromPubkey, {
-          type: 'peer',
-          peerSignal: { type: 'answer', sdp: pc.localDescription.sdp },
-          sessionId: state.sessionId,
-          seq: ++state.outboundSeq,
-        });
-      }
+      const answer = await pc.createAnswer();
+      console.log('[mesh] -> answer to', fromPubkey.slice(0, 8), 'sdp=', answer.sdp.length);
+      await sendSignal(fromPubkey, {
+        type: 'peer',
+        peerSignal: { type: 'answer', sdp: answer.sdp },
+        sessionId: state.sessionId,
+        seq: ++state.outboundSeq,
+      });
+      await pc.setLocalDescription(answer);
     } else if (payload.type === 'answer' && payload.sdp) {
       if (pc.signalingState === 'have-local-offer') {
         await pc.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
@@ -573,6 +562,8 @@ async function handleSignal(fromPubkey, payload) {
     }
   } catch (err) {
     console.warn('[mesh] handleSignal threw', err.message);
+  } finally {
+    releaseSignal();
   }
 }
 
