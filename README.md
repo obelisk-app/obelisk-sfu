@@ -56,7 +56,7 @@ The SFU publishes its kind 31313 advertisement immediately and starts listening 
 - **A public IP** for the host (or 1:1 NAT with `SFU_PUBLIC_IP` set; or UDP port forwarding through a home router).
 - **UDP `40000-40099` open inbound** (configurable). RTP media flows over these ports — straight from the SFU to clients, NOT through Cloudflare.
 - **`cloudflared`** installed and authenticated (`brew install cloudflared && cloudflared tunnel login`). Optional if you set `SKIP_TUNNEL=1`, but you lose the public `/healthz` endpoint.
-- **A Nostr relay** that both your group and the SFU subscribe to. The default is `wss://relay.obelisk.ar`; override with `SFU_RELAYS`.
+- **A Nostr relay** that both your group and the SFU subscribe to. The defaults are `wss://lacrypta-relay.obelisk.ar` and `wss://public.obelisk.ar`; override with `SFU_RELAYS`.
 
 ## Layout
 
@@ -195,7 +195,7 @@ curl https://sfu.example.com/rooms           # active rooms (empty initially)
 And on the relay side:
 
 ```bash
-nak req -k 31313 wss://relay.obelisk.ar      # should show your advertisement
+nak req -k 31313 wss://lacrypta-relay.obelisk.ar      # should show your advertisement
 ```
 
 The advertisement event's pubkey field == your `SFU_NSEC` derived pubkey.
@@ -218,7 +218,7 @@ nak event \
   --tag expiration="$(($(date +%s) + 60))" \
   --content '{"action":"start","params":{"video":true,"screen":true,"maxParticipants":50}}' \
   --sec "$HOST_NSEC" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 In `sfu.log` you should see:
@@ -233,7 +233,7 @@ INFO  [advertise] ...
 Then check the relay for the kind 31314 active-call event:
 
 ```bash
-nak req -k 31314 -d "$CHANNEL_ID" wss://relay.obelisk.ar
+nak req -k 31314 -d "$CHANNEL_ID" wss://lacrypta-relay.obelisk.ar
 ```
 
 Once that's up, mesh-aware Obelisk clients in the channel will see the SFU's `["sfu","1"]` beacon. Connecting clients (after the planned client-side topology switch lands) dial only the SFU.
@@ -287,7 +287,7 @@ nak event \
   --tag t="obelisk-sfu-control" \
   --content '{"action":"end"}' \
   --sec "$OPERATOR_NSEC" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 Or `pkill -TERM -f obelisk-sfu` — it'll close all rooms cleanly.
@@ -302,7 +302,7 @@ nak event \
   --tag t="obelisk-sfu-control" \
   --content '{"action":"kick","params":{"target":"<hex-pubkey>","reason":"spam"}}' \
   --sec "$HOST_NSEC" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 The host of the call OR the operator can kick. The kicked pubkey is added to the room's deny list for the call's lifetime.

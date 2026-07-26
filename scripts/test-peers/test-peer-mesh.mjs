@@ -38,6 +38,7 @@ import {
   MediaStreamTrack,
   RtpPacket,
 } from 'werift';
+import { normalizeMeshSignal } from './mesh-signal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const stateDir = path.join(__dirname, '..', '.test-peer-mesh');
@@ -371,8 +372,8 @@ async function makeOffer(state, reason) {
     if (!pc.localDescription) return;
     console.log('[mesh] -> offer to', remotePubkey.slice(0, 8), 'reason=', reason, 'sdp=', pc.localDescription.sdp.length);
     await sendSignal(remotePubkey, {
-      type: 'offer',
-      sdp: pc.localDescription.sdp,
+      type: 'peer',
+      peerSignal: { type: 'offer', sdp: pc.localDescription.sdp },
       sessionId: state.sessionId,
       seq: ++state.outboundSeq,
     });
@@ -457,8 +458,8 @@ function createPeer(remotePubkey, options = {}) {
   pc.onIceCandidate.subscribe(async (candidate) => {
     if (!candidate) return;
     await sendSignal(remotePubkey, {
-      type: 'ice',
-      candidates: [candidate.toJSON()],
+      type: 'peer',
+      peerSignal: { type: 'candidate', candidate: candidate.toJSON() },
       sessionId: state.sessionId,
       seq: ++state.outboundSeq,
     });
@@ -507,6 +508,8 @@ function createPeer(remotePubkey, options = {}) {
 }
 
 async function handleSignal(fromPubkey, payload) {
+  payload = normalizeMeshSignal(payload);
+  if (!payload) return;
   const state = createPeer(fromPubkey);
   if (!state) return;
   const { pc } = state;
@@ -535,8 +538,8 @@ async function handleSignal(fromPubkey, payload) {
       if (pc.localDescription) {
         console.log('[mesh] -> answer to', fromPubkey.slice(0, 8), 'sdp=', pc.localDescription.sdp.length);
         await sendSignal(fromPubkey, {
-          type: 'answer',
-          sdp: pc.localDescription.sdp,
+          type: 'peer',
+          peerSignal: { type: 'answer', sdp: pc.localDescription.sdp },
           sessionId: state.sessionId,
           seq: ++state.outboundSeq,
         });

@@ -30,7 +30,7 @@ The design follows Obelisk's "no central anything" ethos: an SFU is **operator-d
                          │ kind 25050 (offer/answer/ICE)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Nostr relay — wss://relay.obelisk.ar                           │
+│  Nostr relay — wss://lacrypta-relay.obelisk.ar                           │
 │  (or any relay both parties subscribe to)                       │
 └─┬───────────────────────────────────────────────────────────┬───┘
   │  kind 31313 (advertisement)                               │
@@ -83,7 +83,7 @@ Published by the SFU's own keypair. Replaceable on the `d="obelisk-sfu"` coordin
     ["d", "obelisk-sfu"],
     ["t", "obelisk-sfu-advertisement"],
     ["url", "https://sfu.example.com"],
-    ["relay", "wss://relay.obelisk.ar"],
+    ["relay", "wss://lacrypta-relay.obelisk.ar"],
     ["cap", "50"],
     ["max_rooms", "10"],
     ["codec", "opus"],
@@ -205,7 +205,7 @@ There's one small client-side extension: when the SFU forwards a track from memb
 
 There are three authorization paths a `start` event or direct `/rpc` auth can take:
 
-1. **Trusted-author relay path (production default):** the event was delivered to the SFU on a relay listed in `SFU_TRUSTED_AUTHOR_RELAYS`. That relay's own write-whitelist already gated who could publish; the SFU treats every event from that relay as authorized. This is how the canonical Obelisk deployment works — the operators of `wss://relay.obelisk.ar` curate who can host big-room calls, and the SFU just listens.
+1. **Trusted-author relay path (production default):** the event was delivered to the SFU on a relay listed in `SFU_TRUSTED_AUTHOR_RELAYS`. That relay's own write-whitelist already gated who could publish; the SFU treats every event from that relay as authorized. This is how the canonical Obelisk deployment works — the operators of `wss://lacrypta-relay.obelisk.ar` curate who can host big-room calls, and the SFU just listens.
 2. **Local allow-list path:** the event was delivered on an open relay (e.g. `wss://public.obelisk.ar`). The SFU falls back to checking `allow.json` (or `SFU_ALLOWED_PUBKEYS`) for the publisher's hex pubkey. Useful for solo deployments or testing.
 3. **Trusted-referent follow path:** operators configure `SFU_TRUSTED_REFERENT_PUBKEYS`; the SFU fetches each referent's latest kind 3 contact list from `SFU_FOLLOW_RELAYS`, persists the derived pubkeys in `whitelist_follows.json`, and allows those followed users to authenticate. This mirrors the obelisk-relay admin CLI model.
 
@@ -449,7 +449,7 @@ nak event \
   --tag expiration="$(($(date +%s) + 60))" \
   --content '{"action":"start","params":{"video":true,"screen":true,"maxParticipants":50}}' \
   --sec "<YOUR_NSEC>" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 Watch the SFU's logs for `[call-listener] start accepted from <hostpk>`. Then check the relay for the resulting kind 31314.
@@ -464,7 +464,7 @@ nak event \
   --tag t="obelisk-sfu-control" \
   --content '{"action":"end"}' \
   --sec "<OPERATOR_NSEC>" \
-  wss://relay.obelisk.ar
+  wss://lacrypta-relay.obelisk.ar
 ```
 
 Or just `pkill -TERM -f obelisk-sfu` — the process traps SIGTERM and publishes `31314 status=closed` for every active room before exiting.

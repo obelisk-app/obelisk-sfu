@@ -45,7 +45,7 @@ if (!CHANNEL_ID || !/^[0-9a-f]+$/i.test(CHANNEL_ID)) {
 
 const RELAYS = (process.env.TEST_PEER_RELAYS ?? 'wss://public.obelisk.ar')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const TRUSTED_RELAYS = (process.env.TEST_PEER_TRUSTED_RELAYS ?? 'wss://relay.obelisk.ar,wss://public.obelisk.ar')
+const TRUSTED_RELAYS = (process.env.TEST_PEER_TRUSTED_RELAYS ?? 'wss://lacrypta-relay.obelisk.ar,wss://public.obelisk.ar')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const TURN_URLS = (process.env.TEST_PEER_TURN_URLS ?? process.env.SFU_TURN_URLS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean);

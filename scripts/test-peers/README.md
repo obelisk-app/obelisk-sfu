@@ -33,7 +33,7 @@ Required env when the SFU kind 31313 advertisement is not reachable
 (for example NIP-29-only relays do not store it):
 
 ```bash
-SFU_PUBKEY=<sfu hex pubkey> SFU_URL=https://sfu.obelisk.ar TEST_PEER_RELAYS=wss://relay.obelisk.ar npm run test-peer:sfu -- <channel-id>
+SFU_PUBKEY=<sfu hex pubkey> SFU_URL=https://sfu.obelisk.ar TEST_PEER_RELAYS=wss://lacrypta-relay.obelisk.ar npm run test-peer:sfu -- <channel-id>
 ```
 
 Mesh peers only need relay access and TURN settings:
@@ -41,7 +41,7 @@ Mesh peers only need relay access and TURN settings:
 The mesh peer accepts either a raw channel id or a direct dex URL such as `/app?s=channel&c=...&relay=...`. When a URL is provided, it uses that channel id and converts the relay host into `wss://...` for signaling.
 
 ```bash
-TEST_PEER_RELAYS=wss://relay.obelisk.ar npm run test-peer:mesh -- <channel-id>
+TEST_PEER_RELAYS=wss://lacrypta-relay.obelisk.ar npm run test-peer:mesh -- <channel-id>
 ```
 
 For auth-gated relays, the peer pubkey must be whitelisted on the relay it
@@ -72,6 +72,10 @@ markers:
 
 - `["client", "obelisk-mesh-test-peer"]`
 - `["test-peer", "mesh"]`
+
+Mesh SDP and ICE use the browser's current kind 25050 envelope:
+`{"type":"peer","peerSignal":<simple-peer signal>}`. The diagnostic peer
+still accepts the legacy top-level `offer`, `answer`, and `ice` shapes.
 
 The test peer also opens/adopts the `obelisk-control` RTCDataChannel. It sends
 `hello`, periodic `peerSnapshot`, ping/pong, and incremental peer add/remove
