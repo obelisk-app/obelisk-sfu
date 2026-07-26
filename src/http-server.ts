@@ -39,6 +39,12 @@ import { syncTrustedReferentFollows } from './follow-whitelist.js';
 
 const log = createLogger('http');
 
+export function testPeerModeForChannel(channelKind: string | null, requested?: TestPeerMode): TestPeerMode {
+  if (channelKind === 'voice') return 'mesh';
+  if (channelKind === 'voice-sfu') return 'sfu';
+  return requested ?? 'sfu';
+}
+
 export interface HttpServerDeps {
   cfg: Config;
   sfuPubkey: string;
@@ -311,7 +317,7 @@ export class HttpServer {
       return json(res, 400, { error: 'relays must be an array of ws:// or wss:// URLs' });
     }
     const channel = this.deps.channels.getChannel(channelId);
-    const mode = data.mode ?? this.inferTestPeerMode(channel?.kind ?? null);
+    const mode = testPeerModeForChannel(channel?.kind ?? null, data.mode);
     if (mode !== 'sfu' && mode !== 'mesh') {
       return json(res, 400, { error: 'mode must be sfu or mesh' });
     }
@@ -340,10 +346,6 @@ export class HttpServer {
     } catch (err) {
       json(res, 500, { error: (err as Error).message });
     }
-  }
-
-  private inferTestPeerMode(channelKind: string | null): TestPeerMode {
-    return channelKind === 'voice' ? 'mesh' : 'sfu';
   }
 
   private defaultTestPeerIdentityMode(mode: TestPeerMode, relays: readonly string[]): TestPeerIdentityMode {
@@ -701,7 +703,7 @@ export class HttpServer {
       relay,
       channelKind: channel?.kind ?? 'unknown',
       voiceMode,
-      testPeerMode: this.inferTestPeerMode(channel?.kind ?? null),
+      testPeerMode: testPeerModeForChannel(channel?.kind ?? null),
       channel,
     });
   }
