@@ -259,6 +259,13 @@ Or just Ctrl-C the foreground `npm run raise`. Either way, the SFU traps SIGTERM
 - notifies connected direct-RPC sessions
 - closes mediasoup transports, routers, and workers cleanly
 
+### Manage access
+
+Open `/admin` and sign with the operator key. The access manager accepts
+npub, hex, or NIP-05 identities; resolves kind-0 names and pictures; and lets
+you add, search, copy, or remove explicit callers and trusted reference
+accounts. Changes apply immediately.
+
 ### Reload allow-list
 
 Edit `allow.json`, then:

@@ -621,11 +621,6 @@ export class HttpServer {
     <ul>
       ${cfg.relays.map((r) => `<li>· ${escape(r)}</li>`).join('')}
     </ul>
-    ${cfg.trustedAuthorRelays.length > 0 ? `
-    <h2 style="margin-top:16px">Trusted-author relays</h2>
-    <ul>
-      ${cfg.trustedAuthorRelays.map((r) => `<li>· ${escape(r)}</li>`).join('')}
-    </ul>` : ''}
   </section>
 
   <footer>

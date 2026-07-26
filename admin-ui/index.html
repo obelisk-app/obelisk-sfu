@@ -72,6 +72,21 @@
   .relay-row:last-child { border-bottom: none; }
   .relay-row .url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
   .relay-row .meta { color: var(--lc-muted); font-size: 11px; margin-top: 2px; }
+  .people-toolbar { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 12px; }
+  .people-list { display: grid; gap: 8px; }
+  .person { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--lc-border); border-radius: 10px; background: var(--lc-black); }
+  .person-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .person-avatar { width: 40px; height: 40px; border-radius: 9999px; object-fit: cover; flex: 0 0 auto; border: 2px solid rgba(180,249,83,.2); }
+  .person-fallback { display: grid; place-items: center; background: rgba(180,249,83,.1); color: var(--lc-green); font-size: 12px; font-weight: 700; }
+  .person-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person-id { color: var(--lc-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  .person-actions button { padding: 5px 9px; font-size: 11px; }
+  .access-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .access-panel { border: 1px solid var(--lc-border); border-radius: 10px; padding: 14px; min-width: 0; }
+  .access-panel h3 { margin: 0 0 4px; font-size: 14px; }
+  .access-panel > p { margin: 0 0 12px; font-size: 11px; color: var(--lc-muted); }
+  @media (max-width: 720px) { .access-grid { grid-template-columns: 1fr; } .person { align-items: flex-start; } }
 </style>
 </head>
 <body>
@@ -110,44 +125,51 @@
     <div id="relays-list"></div>
   </section>
 
-  <section id="settings-card" class="card" style="display:none">
-    <h2>Settings</h2>
-    <p class="muted">Changes to <span class="mono">relays</span> and <span class="mono">trusted-author relays</span> require a restart (button below). Allow-list and allow-all hot-swap.</p>
-    <div class="field">
-      <label>Listening relays (comma or newline separated, wss://)</label>
-      <textarea id="i-relays" rows="2"></textarea>
+  <section id="access-card" class="card" style="display:none">
+    <h2>Access management</h2>
+    <p class="muted" style="font-size:12px;margin:0 0 14px">Manage callers like the Obelisk relay: npub, hex, or NIP-05 input with profile pictures and names resolved from Nostr.</p>
+    <div class="access-grid">
+      <div class="access-panel">
+        <h3>Allowed callers <span class="badge" id="allowed-count">0</span></h3>
+        <p>These people can authenticate directly to this SFU.</p>
+        <div class="people-toolbar">
+          <input type="text" id="i-allowed-add" placeholder="npub1..., hex, or name@domain" />
+          <button id="allowed-add-btn" class="pill pill-primary">Add</button>
+        </div>
+        <input type="text" id="i-allowed-search" placeholder="Search name, npub, or NIP-05" style="margin-bottom:12px" />
+        <div id="allowed-list" class="people-list"></div>
+      </div>
+      <div class="access-panel">
+        <h3>Reference accounts <span class="badge" id="referent-count">0</span></h3>
+        <p>Accounts whose latest kind-3 follows are also allowed.</p>
+        <div class="people-toolbar">
+          <input type="text" id="i-referent-add" placeholder="npub1..., hex, or name@domain" />
+          <button id="referent-add-btn" class="pill pill-primary">Add</button>
+        </div>
+        <div id="referent-list" class="people-list"></div>
+        <button id="sync-follows-btn" class="pill" style="margin-top:12px">Sync follows</button>
+      </div>
     </div>
-    <div class="field">
-      <label>Trusted-author relays</label>
-      <textarea id="i-trusted" rows="2"></textarea>
-    </div>
-    <div class="field">
-      <label>Allowed pubkeys (hex, one per line)</label>
-      <textarea id="i-allowed" rows="3"></textarea>
-    </div>
-    <div class="field">
-      <label>Trusted referent pubkeys (hex, one per line)</label>
-      <textarea id="i-referents" rows="3"></textarea>
-      <p class="muted" style="font-size:11px;margin:6px 0 0">
-        The SFU syncs each referent's latest kind 3 contact list and allows followed pubkeys to auth directly.
-      </p>
-    </div>
-    <div class="kv" style="margin-bottom:14px">
+    <div class="kv" style="margin:16px 0 14px">
       <div>Follow-derived</div><div class="mono" id="f-followAllowedCount">—</div>
       <div>Test bypass</div><div class="mono" id="f-whitelistBypass">—</div>
     </div>
     <div class="field row">
-      <button id="sync-follows-btn" class="pill">Sync referent follows</button>
       <button id="bypass-hour-btn" class="pill">Disable whitelist for 1 h</button>
       <button id="clear-bypass-btn" class="pill">Re-enable whitelist</button>
     </div>
     <div class="field row">
       <input type="checkbox" id="i-allowAll" />
-      <label for="i-allowAll" style="margin:0">Allow all (testing only — bypasses allow-list)</label>
+      <label for="i-allowAll" style="margin:0">Allow all (testing only)</label>
     </div>
-    <div class="field row">
-      <input type="checkbox" id="i-requireAllowedPubkey" />
-      <label for="i-requireAllowedPubkey" style="margin:0">Strict allow-list: require sender on allow-list even when event came from a trusted-author relay</label>
+  </section>
+
+  <section id="settings-card" class="card" style="display:none">
+    <h2>Settings</h2>
+    <p class="muted">Relay changes require a restart. Access changes above apply immediately.</p>
+    <div class="field">
+      <label>Listening relays (comma or newline separated, wss://)</label>
+      <textarea id="i-relays" rows="2"></textarea>
     </div>
     <div class="field">
       <label>Public URL (advertised in kind 31313)</label>
@@ -212,11 +234,11 @@
 <div id="toast"></div>
 
 <script type="importmap">
-  { "imports": { "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19", "@nostr-wot/signers": "https://esm.sh/@nostr-wot/signers@0.4.0?bundle" } }
+  { "imports": { "nostr-tools": "https://esm.sh/nostr-tools@2.24.1", "@nostr-wot/signers": "https://esm.sh/@nostr-wot/signers@0.4.0?bundle" } }
 </script>
 
 <script type="module">
-  import * as nip19 from 'nostr-tools/nip19';
+  import { SimplePool, nip19 } from "nostr-tools";
   import { Nip07Signer } from '@nostr-wot/signers';
 
   const $ = (id) => document.getElementById(id);
@@ -225,6 +247,178 @@
   let myPubkey = null;
   let snapshot = null;
   let adminSigner = null;
+
+  const PROFILE_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://purplepag.es"];
+  const profilePool = new SimplePool();
+  const profileCache = new Map();
+  const profileRequested = new Set();
+
+  async function fetchProfiles(pubkeys) {
+    const wanted = pubkeys.filter((pk) => !profileCache.has(pk) && !profileRequested.has(pk));
+    if (wanted.length === 0) return;
+    wanted.forEach((pk) => profileRequested.add(pk));
+    try {
+      const events = await profilePool.querySync(PROFILE_RELAYS, { kinds: [0], authors: wanted }, { maxWait: 5000 });
+      const latest = new Map();
+      for (const ev of events) {
+        const prior = latest.get(ev.pubkey);
+        if (!prior || prior.created_at < ev.created_at) latest.set(ev.pubkey, ev);
+      }
+      for (const pk of wanted) {
+        const ev = latest.get(pk);
+        if (!ev) { profileCache.set(pk, {}); continue; }
+        try {
+          const data = JSON.parse(ev.content);
+          profileCache.set(pk, {
+            name: typeof data.name === "string" ? data.name : "",
+            display_name: typeof data.display_name === "string" ? data.display_name : "",
+            picture: typeof data.picture === "string" ? data.picture : "",
+            nip05: typeof data.nip05 === "string" ? data.nip05 : "",
+          });
+        } catch { profileCache.set(pk, {}); }
+      }
+    } catch {
+      wanted.forEach((pk) => profileCache.set(pk, {}));
+    }
+  }
+
+  function safePicture(raw) {
+    try {
+      const url = new URL(raw);
+      return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+    } catch { return ""; }
+  }
+
+  function shortNpub(npub) {
+    return npub.length > 20 ? npub.slice(0, 12) + "…" + npub.slice(-6) : npub;
+  }
+
+  function personMatches(pk, profile, query) {
+    if (!query) return true;
+    const npub = nip19.npubEncode(pk);
+    return [pk, npub, profile.name, profile.display_name, profile.nip05]
+      .some((value) => String(value || "").toLowerCase().includes(query));
+  }
+
+  function renderPeople(id, pubkeys, kind, query = "") {
+    const list = $(id);
+    list.replaceChildren();
+    const visible = pubkeys.filter((pk) => personMatches(pk, profileCache.get(pk) || {}, query));
+    if (visible.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.style.cssText = "font-size:12px;margin:4px 0";
+      empty.textContent = query ? "No matching people." : "Nobody added yet.";
+      list.append(empty);
+      return;
+    }
+    for (const pk of visible) {
+      const profile = profileCache.get(pk) || {};
+      const npub = nip19.npubEncode(pk);
+      const name = profile.display_name || profile.name || shortNpub(npub);
+      const detail = profile.nip05 || shortNpub(npub);
+      const picture = safePicture(profile.picture || "");
+      const row = document.createElement("div");
+      row.className = "person";
+      const main = document.createElement("div");
+      main.className = "person-main";
+      const avatar = picture ? document.createElement("img") : document.createElement("div");
+      avatar.className = picture ? "person-avatar" : "person-avatar person-fallback";
+      if (picture) {
+        avatar.src = picture;
+        avatar.alt = "";
+        avatar.addEventListener("error", () => { avatar.style.visibility = "hidden"; });
+      } else {
+        avatar.textContent = String(profile.name || name || "??").slice(0, 2).toUpperCase();
+      }
+      const identity = document.createElement("div");
+      identity.style.minWidth = "0";
+      const nameEl = document.createElement("div");
+      nameEl.className = "person-name";
+      nameEl.textContent = name;
+      const idEl = document.createElement("div");
+      idEl.className = "person-id";
+      idEl.textContent = detail;
+      identity.append(nameEl, idEl);
+      main.append(avatar, identity);
+      const actions = document.createElement("div");
+      actions.className = "person-actions";
+      const copy = document.createElement("button");
+      copy.className = "pill";
+      copy.textContent = "Copy npub";
+      copy.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(npub);
+        toast("npub copied", "ok");
+      });
+      const remove = document.createElement("button");
+      remove.className = "pill pill-danger";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => removePerson(kind, pk));
+      actions.append(copy, remove);
+      row.append(main, actions);
+      list.append(row);
+    }
+  }
+
+  function renderAccess(s) {
+    const allowed = s.allowed || [];
+    const referents = s.trustedReferentPubkeys || [];
+    $("allowed-count").textContent = String(allowed.length);
+    $("referent-count").textContent = String(referents.length);
+    const query = $("i-allowed-search").value.trim().toLowerCase();
+    renderPeople("allowed-list", allowed, "allowed", query);
+    renderPeople("referent-list", referents, "referents");
+    const missing = [...new Set([...allowed, ...referents])].filter((pk) => !profileCache.has(pk) && !profileRequested.has(pk));
+    if (missing.length > 0) fetchProfiles(missing).then(() => { if (snapshot) renderAccess(snapshot); });
+  }
+
+  async function normalizePersonInput(raw) {
+    const value = raw.trim();
+    if (/^[0-9a-f]{64}$/i.test(value)) return value.toLowerCase();
+    if (value.toLowerCase().startsWith("npub1")) {
+      const decoded = nip19.decode(value);
+      if (decoded.type === "npub" && typeof decoded.data === "string") return decoded.data.toLowerCase();
+    }
+    if (value.includes("@")) {
+      const parts = value.split("@");
+      const name = parts[0];
+      const domain = parts[1];
+      if (!name || !domain) throw new Error("Invalid NIP-05 identifier");
+      const res = await fetch("https://" + domain + "/.well-known/nostr.json?name=" + encodeURIComponent(name));
+      if (!res.ok) throw new Error("NIP-05 lookup failed: " + res.status);
+      const data = await res.json();
+      const pk = data && data.names && data.names[name];
+      if (typeof pk === "string" && /^[0-9a-f]{64}$/i.test(pk)) return pk.toLowerCase();
+      throw new Error("NIP-05 did not return a valid pubkey");
+    }
+    throw new Error("Enter an npub, 64-character hex pubkey, or NIP-05 address");
+  }
+
+  async function addPerson(kind) {
+    const input = kind === "allowed" ? $("i-allowed-add") : $("i-referent-add");
+    try {
+      const pk = await normalizePersonInput(input.value);
+      const field = kind === "allowed" ? "allowed" : "trustedReferentPubkeys";
+      const current = snapshot[field] || [];
+      if (current.includes(pk)) { toast("Already added", "ok"); return; }
+      const result = await api("/admin/state", "PUT", { [field]: [...current, pk] });
+      snapshot = result.state;
+      input.value = "";
+      render(snapshot);
+      toast(kind === "allowed" ? "Caller allowed" : "Reference account added", "ok");
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  async function removePerson(kind, pk) {
+    if (!confirm("Remove this person?")) return;
+    try {
+      const field = kind === "allowed" ? "allowed" : "trustedReferentPubkeys";
+      const result = await api("/admin/state", "PUT", { [field]: (snapshot[field] || []).filter((item) => item !== pk) });
+      snapshot = result.state;
+      render(snapshot);
+      toast("Removed", "ok");
+    } catch (err) { toast(err.message, "err"); }
+  }
 
   function toast(msg, kind) {
     const t = $('toast');
@@ -284,7 +478,8 @@
       $('login-card').style.display = 'none';
       $('state-card').style.display = '';
       $('relays-card').style.display = '';
-      $('settings-card').style.display = '';
+      $("access-card").style.display = "";
+      $("settings-card").style.display = "";
       $('rooms-card').style.display = '';
       if (snapshot && snapshot.testPeers !== null) {
         $('test-peers-card').style.display = '';
@@ -367,11 +562,7 @@
     // Inputs only on the FULL render path (initial load + manual Refresh).
     // Auto-refresh skips these so a half-typed setting isn't clobbered.
     $('i-relays').value = s.relays.join('\n');
-    $('i-trusted').value = s.trustedAuthorRelays.join('\n');
-    $('i-allowed').value = s.allowed.join('\n');
-    $('i-referents').value = (s.trustedReferentPubkeys || []).join('\n');
     $('i-allowAll').checked = !!s.allowAll;
-    $('i-requireAllowedPubkey').checked = !!s.requireAllowedPubkey;
     $('i-publicUrl').value = s.publicUrl || '';
     $('i-region').value = s.region || '';
     $('i-maxCallDurationSeconds').value = String(s.maxCallDurationSeconds ?? 3600);
@@ -400,7 +591,8 @@
 
     renderRelays(s.relayHealth || []);
     $('f-followAllowedCount').textContent = `${s.followAllowedCount || 0} pubkeys`;
-    $('f-whitelistBypass').textContent = formatWhitelistBypass(s.whitelistBypassUntil);
+    $("f-whitelistBypass").textContent = formatWhitelistBypass(s.whitelistBypassUntil);
+    renderAccess(s);
 
     // Test-peer relay textarea: only prefill the placeholder hint so the
     // operator sees what the default would be without it being treated as
@@ -611,14 +803,9 @@
   }
 
   async function save() {
-    if (!confirm('Save changes to runtime.json? Allow-list / allow-all apply immediately; relay changes need a restart.')) return;
+    if (!confirm("Save SFU settings to runtime.json? Relay changes need a restart.")) return;
     const patch = {
       relays: parseLines($('i-relays').value),
-      trustedAuthorRelays: parseLines($('i-trusted').value),
-      allowed: parseLines($('i-allowed').value),
-      trustedReferentPubkeys: parseLines($('i-referents').value).map((pk) => pk.toLowerCase()),
-      allowAll: $('i-allowAll').checked,
-      requireAllowedPubkey: $('i-requireAllowedPubkey').checked,
       publicUrl: $('i-publicUrl').value.trim() || null,
       region: $('i-region').value.trim() || null,
       maxCallDurationSeconds: parseMaxDuration($('i-maxCallDurationSeconds').value),
@@ -654,6 +841,15 @@
     }
   }
 
+  async function setAllowAll() {
+    try {
+      const result = await api("/admin/state", "PUT", { allowAll: $("i-allowAll").checked });
+      snapshot = result.state;
+      renderLive(snapshot);
+      toast(snapshot.allowAll ? "SFU access is open" : "Whitelist enforced", "ok");
+    } catch (err) { toast(err.message, "err"); }
+  }
+
   async function restart() {
     if (!confirm('Restart the SFU process? Active calls will drop.')) return;
     try {
@@ -665,7 +861,13 @@
     }
   }
 
-  $('login-btn').addEventListener('click', login);
+  $("login-btn").addEventListener("click", login);
+  $("allowed-add-btn").addEventListener("click", () => addPerson("allowed"));
+  $("referent-add-btn").addEventListener("click", () => addPerson("referents"));
+  $("i-allowed-add").addEventListener("keydown", (event) => { if (event.key === "Enter") addPerson("allowed"); });
+  $("i-referent-add").addEventListener("keydown", (event) => { if (event.key === "Enter") addPerson("referents"); });
+  $("i-allowed-search").addEventListener("input", () => { if (snapshot) renderAccess(snapshot); });
+  $("i-allowAll").addEventListener("change", setAllowAll);
   $('save-btn').addEventListener('click', save);
   $('restart-btn').addEventListener('click', restart);
   $('refresh-btn').addEventListener('click', () => refresh().then(() => toast('Refreshed', 'ok')).catch((e) => toast(e.message, 'err')));

@@ -104,7 +104,7 @@ immediate and independent of relay delivery.
 | `/channels` | public | Sanitized registered voice channels. |
 | `/channels/resolve` | public | Resolves channel kind and test-peer mode. |
 | `/rooms` | public | Sanitized room counts; no participant pubkeys. |
-| `/admin` | operator | NIP-98 protected operator UI/API. |
+| `/admin` | operator | NIP-98 protected operator UI/API with profile-rich npub, hex, and NIP-05 access management. |
 | `/rpc` | signed caller | WebSocket mediasoup RPC. |
 
 ## Media engine and dependencies
