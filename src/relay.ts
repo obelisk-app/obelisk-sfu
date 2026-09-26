@@ -115,7 +115,21 @@ export class RelayPool {
    */
   async publish(template: EventTemplate): Promise<VerifiedEvent> {
     const event = this.identity.sign(template);
-    const results = this.pool.publish(this.writeRelays, event);
+    // Our relays answer an unauthenticated write with `restricted: … not
+    // whitelisted` rather than `auth-required:`, so nostr-tools' built-in
+    // auth-and-retry never fires. They also drop idle sockets, so every
+    // 5-minute advertisement refresh raced AUTH on a fresh connection, got
+    // rejected, and the watchdog restarted the SFU every 10 minutes.
+    // Authenticate that connection explicitly and retry once.
+    const results = this.pool.publish(this.writeRelays, event).map((p, i) =>
+      p.catch((err: unknown) => {
+        const url = this.writeRelays[i];
+        const msg = String((err as Error)?.message ?? err);
+        if (!url || !isRelayAccessDenied(msg)) throw err;
+        log.debug('publish rejected before AUTH — authenticating and retrying', { relay: url, kind: event.kind });
+        return this.publishAfterAuth(url, event);
+      }),
+    );
 
     let firstAck: string | null = null;
     let firstErr: unknown = null;
@@ -200,6 +214,16 @@ export class RelayPool {
   private readonly signAuthChallenge = (template: EventTemplate): Promise<VerifiedEvent> => {
     return Promise.resolve(this.identity.sign(template));
   };
+
+  /** NIP-42 AUTH on this relay's connection, then publish again. */
+  private async publishAfterAuth(url: string, event: VerifiedEvent): Promise<string> {
+    const relay = await this.pool.ensureRelay(url);
+    // The challenge arrives right after connect; wait briefly if it hasn't yet.
+    const hasChallenge = () => !!(relay as unknown as { challenge?: string }).challenge;
+    for (let i = 0; i < 30 && !hasChallenge(); i++) await new Promise((r) => setTimeout(r, 100));
+    await relay.auth(this.signAuthChallenge);
+    return relay.publish(event);
+  }
 
   /**
    * Subscribe to a filter on each given relay separately, with the source
