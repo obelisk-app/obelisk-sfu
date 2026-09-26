@@ -32,6 +32,7 @@ import { fileURLToPath } from 'node:url';
 
 import 'dotenv/config';
 import { SimplePool, finalizeEvent, getPublicKey, nip19 } from 'nostr-tools';
+import { publishWithAuth, subscribeResilient } from './relay-auth.mjs';
 import { generateSecretKey } from 'nostr-tools/pure';
 import {
   RTCPeerConnection,
@@ -152,16 +153,15 @@ if (ICE_PORT_RANGE) {
 }
 console.log('[mesh] max lifetime', MAX_LIFETIME_SEC, 's');
 
-const pool = new SimplePool({
-  automaticallyAuth: () => (template) => Promise.resolve(finalizeEvent(template, secretKey)),
-});
+const signAuth = (template) => Promise.resolve(finalizeEvent(template, secretKey));
+const pool = new SimplePool({ automaticallyAuth: () => signAuth });
 
 async function publish(template, label = 'event') {
   const ev = finalizeEvent({
     ...template,
     created_at: template.created_at ?? Math.floor(Date.now() / 1000),
   }, secretKey);
-  const results = await Promise.allSettled(pool.publish(RELAYS, ev));
+  const results = await publishWithAuth(pool, RELAYS, ev, signAuth);
   const rejected = results
     .map((r, i) => r.status === 'rejected' ? RELAYS[i] + ': ' + (r.reason?.message ?? r.reason) : null)
     .filter(Boolean);
@@ -614,10 +614,12 @@ function upsertRosterBeacon(ev) {
   for (const state of peers.values()) sendControlSnapshot(state);
 }
 
-pool.subscribe(RELAYS, {
-  kinds: [25050],
-  since: Math.floor(Date.now() / 1000) - 30,
-}, {
+// Indexed filters (`#p` / `#e`): the relays ration tag-less "scrape" REQs
+// and close them when over budget — voice subscriptions must be targeted.
+subscribeResilient(pool, RELAYS, { kinds: [25050], '#p': [pubkey] }, {
+  label: 'signals',
+  signer: signAuth,
+  sinceWindow: 30,
   onevent: async (ev) => {
     if (seenSignalIds.has(ev.id)) return;
     seenSignalIds.add(ev.id);
@@ -632,10 +634,10 @@ pool.subscribe(RELAYS, {
   },
 });
 
-pool.subscribe(RELAYS, {
-  kinds: [20078],
-  since: Math.floor(Date.now() / 1000) - 60,
-}, {
+subscribeResilient(pool, RELAYS, { kinds: [20078], '#e': [CHANNEL_ID] }, {
+  label: 'roster',
+  signer: signAuth,
+  sinceWindow: 60,
   onevent: upsertRosterBeacon,
 });
 

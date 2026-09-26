@@ -72,8 +72,8 @@ export class TestPeerSpawner {
   }
 
   /**
-   * Fork a synthetic test peer targeting channelId. Mesh peers normally use
-   * an ephemeral identity; whitelisted relays can ask for the SFU identity.
+   * Fork a synthetic test peer targeting channelId. Mesh peers sign as the
+   * SFU (admitted on the gated Obelisk relays) unless asked for 'ephemeral'.
    * Returns immediately after spawn; the script handles
    * discovery/media startup asynchronously.
    */
@@ -88,7 +88,7 @@ export class TestPeerSpawner {
 
     const peerId = randomBytes(8).toString('hex');
     const identityMode: TestPeerIdentityMode = mode === 'mesh'
-      ? (opts.identityMode ?? 'ephemeral')
+      ? (opts.identityMode ?? 'sfu')
       : 'ephemeral';
     const skHex = identityMode === 'sfu'
       ? this.cfg.nsecHex

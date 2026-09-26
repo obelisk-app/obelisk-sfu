@@ -39,6 +39,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { SimplePool, finalizeEvent, getPublicKey, nip19 } from 'nostr-tools';
+import { publishWithAuth } from './relay-auth.mjs';
 import { generateSecretKey } from 'nostr-tools/pure';
 
 // NIP-42 AUTH support — lacrypta-relay.obelisk.ar gates reads + writes on
@@ -122,13 +123,12 @@ console.log('[test-ms] pubkey=', pubkey);
 console.log('[test-ms] npub=', nip19.npubEncode(pubkey));
 console.log('[test-ms] channel=', CHANNEL_ID);
 
-const pool = new SimplePool({
-  automaticallyAuth: () => (template) => Promise.resolve(finalizeEvent(template, secretKey)),
-});
+const signAuth = (template) => Promise.resolve(finalizeEvent(template, secretKey));
+const pool = new SimplePool({ automaticallyAuth: () => signAuth });
 
 function publish(template) {
   const ev = finalizeEvent({ ...template, created_at: Math.floor(Date.now() / 1000) }, secretKey);
-  return Promise.allSettled(pool.publish(RELAYS, ev));
+  return publishWithAuth(pool, RELAYS, ev, signAuth);
 }
 
 // ── 1. SFU identity ────────────────────────────────────────────────────
@@ -151,6 +151,7 @@ if (process.env.SFU_PUBKEY && process.env.SFU_URL) {
       RELAYS,
       { kinds: [31313], limit: 5 },
       {
+        onauth: signAuth,
         onevent(ev) {
           const url = ev.tags.find((t) => t[0] === 'url')?.[1];
           if (!url) return;
