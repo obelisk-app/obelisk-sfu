@@ -34,6 +34,7 @@ import {
   verifyNip98,
   type RuntimeOverrides,
 } from './admin.js';
+import { AdminSessions, sessionCookie } from './admin-session.js';
 import { attachDirectRpc } from './direct-rpc.js';
 import { syncTrustedReferentFollows } from './follow-whitelist.js';
 
@@ -75,6 +76,7 @@ const HEALTHZ_ALL_RELAYS_DEAD_SEC = 15 * 60;
 export class HttpServer {
   private server: Server | null = null;
   private shuttingDown = false;
+  private readonly sessions = new AdminSessions();
 
   constructor(private readonly deps: HttpServerDeps) {}
 
@@ -117,8 +119,14 @@ export class HttpServer {
     if (method === 'POST' && (url === '/test/inject' || url.startsWith('/test/inject?'))) {
       return void this.handleTestInject(req, res);
     }
-    if (url === '/admin' || url === '/admin/' || url.startsWith('/admin/ui')) {
+    if (url === '/admin' || url === '/admin/' || url.startsWith('/admin/ui') || url.startsWith('/admin/assets/')) {
       return this.handleAdminUi(req, res, url);
+    }
+    if (url === '/admin/session') {
+      if (method === 'GET') return this.handleSessionGet(req, res);
+      if (method === 'POST') return this.handleSessionPost(req, res);
+      if (method === 'DELETE') return this.handleSessionDelete(req, res);
+      return json(res, 405, { error: 'method not allowed' });
     }
     if (url === '/admin/state' || url.startsWith('/admin/state?')) {
       if (method === 'GET') return void this.handleAdminGet(req, res);
@@ -173,9 +181,13 @@ export class HttpServer {
   }
 
   private authOrFail(req: IncomingMessage, res: ServerResponse, method: string): string | null {
+    // Console session cookie first; the operator check is repeated on every
+    // request so changing the operator key revokes existing sessions.
+    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
+    const sessionPubkey = this.sessions.lookup(req.headers.cookie);
+    if (sessionPubkey && sessionPubkey === op) return sessionPubkey;
     try {
       const pubkey = verifyNip98(req.headers.authorization, method, this.fullUrl(req));
-      const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
       if (pubkey !== op) {
         json(res, 403, { error: 'not the operator', operator: op });
         return null;
@@ -186,6 +198,44 @@ export class HttpServer {
       json(res, e.status ?? 401, { error: e.message });
       return null;
     }
+  }
+
+  /** GET /admin/session — who (if anyone) the session cookie belongs to. */
+  private handleSessionGet(req: IncomingMessage, res: ServerResponse): void {
+    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
+    const pubkey = this.sessions.lookup(req.headers.cookie);
+    json(res, 200, pubkey && pubkey === op ? { authed: true, pubkey } : { authed: false });
+  }
+
+  /**
+   * POST /admin/session — exchange ONE NIP-98 signature (operator key) for
+   * an HttpOnly session cookie, so the console doesn't need a signature per
+   * request (unworkable with NIP-46 remote signers).
+   */
+  private handleSessionPost(req: IncomingMessage, res: ServerResponse): void {
+    let pubkey: string;
+    try {
+      pubkey = verifyNip98(req.headers.authorization, 'POST', this.fullUrl(req));
+    } catch (err) {
+      const e = err as AuthError;
+      return json(res, e.status ?? 401, { error: e.message });
+    }
+    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
+    if (pubkey !== op) return json(res, 403, { error: 'not the operator', operator: op });
+    const { token, expiresAt } = this.sessions.issue(pubkey);
+    res.setHeader('set-cookie', sessionCookie(token, { secure: this.isHttps(req) }));
+    log.info('admin session opened', { pubkey: pubkey.slice(0, 8) });
+    json(res, 200, { authed: true, pubkey, expiresAt });
+  }
+
+  private handleSessionDelete(req: IncomingMessage, res: ServerResponse): void {
+    this.sessions.revoke(req.headers.cookie);
+    res.setHeader('set-cookie', sessionCookie(null, { secure: this.isHttps(req) }));
+    json(res, 200, { ok: true });
+  }
+
+  private isHttps(req: IncomingMessage): boolean {
+    return ((req.headers['x-forwarded-proto'] as string) ?? 'https') === 'https';
   }
 
   private handleAdminGet(req: IncomingMessage, res: ServerResponse): void {
@@ -328,7 +378,7 @@ export class HttpServer {
       const linkRelays = parsedInput.relay ? [parsedInput.relay] : undefined;
       const inferredRelays = mode === 'mesh' && channel?.relays?.length ? channel.relays : undefined;
       const relays = data.relays ?? linkRelays ?? inferredRelays;
-      const identityMode = data.identityMode ?? this.defaultTestPeerIdentityMode(mode, relays ?? []);
+      const identityMode = data.identityMode ?? this.defaultTestPeerIdentityMode(mode);
       const info = this.deps.testPeers.spawn(channelId, {
         ...(relays ? { relays } : {}),
         mode,
@@ -348,18 +398,16 @@ export class HttpServer {
     }
   }
 
-  private defaultTestPeerIdentityMode(mode: TestPeerMode, relays: readonly string[]): TestPeerIdentityMode {
-    if (mode !== 'mesh') return 'ephemeral';
-    if (relays.length === 0) return 'ephemeral';
-    return relays.every((relay) => this.isOpenTestPeerRelay(relay)) ? 'ephemeral' : 'sfu';
-  }
-
-  private isOpenTestPeerRelay(relay: string): boolean {
-    try {
-      return new URL(relay).hostname === 'public.obelisk.ar';
-    } catch {
-      return false;
-    }
+  /**
+   * Mesh test peers sign as the SFU by default: both Obelisk relays gate
+   * reads and writes on AUTH + whitelist/WoT, and a fresh ephemeral key is
+   * admitted by neither (its beacons were rejected and it never saw a
+   * roster). The dex still classifies it as a mesh test peer from its beacon
+   * markers, not as the SFU. `identityMode: 'ephemeral'` stays available for
+   * relays that are genuinely open.
+   */
+  private defaultTestPeerIdentityMode(mode: TestPeerMode): TestPeerIdentityMode {
+    return mode === 'mesh' ? 'sfu' : 'ephemeral';
   }
 
   private async handleTestPeerStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -428,12 +476,13 @@ export class HttpServer {
     // this compiled file so it works under both `node dist/index.js` and
     // `tsx watch src/index.ts`.
     const here = dirname(fileURLToPath(import.meta.url));
+    // The console is a built app (admin-ui/ → `npm run build` → admin-ui/dist).
     const baseGuess = [
-      resolve(here, '../admin-ui'),       // dist/ → ../admin-ui
-      resolve(here, '../../admin-ui'),    // src/  → ../../admin-ui (dev)
+      resolve(here, '../admin-ui/dist'),       // dist/ → ../admin-ui/dist
+      resolve(here, '../../admin-ui/dist'),    // src/  → ../../admin-ui/dist (dev)
     ].find(existsSync);
     if (!baseGuess) {
-      return json(res, 500, { error: 'admin-ui not found on disk' });
+      return json(res, 500, { error: 'admin console not built — run `npm run build:admin`' });
     }
     let rel = url.replace(/^\/admin\/?(ui\/?)?/, '') || 'index.html';
     if (rel === '' || rel === '/') rel = 'index.html';
@@ -544,87 +593,100 @@ export class HttpServer {
     const escape = (s: string) => s.replace(/[&<>"]/g, (c) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
     }[c] as string));
+    const d = Math.floor(uptime / 86400);
+    const h = Math.floor((uptime % 86400) / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const uptimeLabel = d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+    const channels = this.deps.channels.getStatus();
     const html = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#0a0a0a" />
 <title>Obelisk SFU</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 <style>
-  :root {
-    --lc-black: #0a0a0a;
-    --lc-dark: #171717;
-    --lc-border: #262626;
-    --lc-green: #b4f953;
-    --lc-white: #fafafa;
-    --lc-muted: #a3a3a3;
-  }
+  :root { --black:#0a0a0a; --dark:#171717; --border:#262626; --green:#b4f953; --white:#fafafa; --muted:#a3a3a3; --olive:#1e2812; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--lc-black); color: var(--lc-white); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  body {
-    min-height: 100vh;
-    background-image: linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
-    background-size: 32px 32px;
-  }
-  main { max-width: 760px; margin: 0 auto; padding: 64px 20px 80px; }
-  .hero { text-align: center; margin-bottom: 32px; }
-  .hero h1 { margin: 0; font-size: 40px; letter-spacing: .02em; }
-  .hero h1 .acc { color: var(--lc-green); }
-  .hero p { margin: 12px auto 0; max-width: 520px; color: var(--lc-muted); font-size: 14px; line-height: 1.5; }
-  .pill {
-    display: inline-block; padding: 10px 20px; border-radius: 9999px;
-    background: var(--lc-green); color: var(--lc-black); font-size: 14px; font-weight: 600;
-    text-decoration: none; margin: 16px 6px 0;
-    transition: opacity .15s;
-  }
-  .pill:hover { opacity: .85; }
-  .pill.secondary { background: var(--lc-border); color: var(--lc-white); }
-  .card { background: var(--lc-dark); border: 1px solid var(--lc-border); border-radius: 12px; padding: 20px; margin-top: 20px; }
-  h2 { margin: 0 0 12px; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--lc-muted); }
-  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; align-items: baseline; font-size: 13px; }
-  .kv > div:nth-child(odd) { color: var(--lc-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
-  .kv > div:nth-child(even) { word-break: break-all; }
+  html, body { margin: 0; background: var(--black); color: var(--white); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+  body { min-height: 100vh; background-image: linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px); background-size: 60px 60px; }
+  main { max-width: 860px; margin: 0 auto; padding: 72px 20px 64px; position: relative; }
+  .orb { position: absolute; top: -40px; left: 50%; transform: translateX(-50%); width: 520px; height: 520px; border-radius: 9999px; pointer-events: none; background: radial-gradient(circle, rgba(180,249,83,.10) 0%, transparent 65%); }
+  .hero { text-align: center; position: relative; }
+  .mark { width: 64px; height: 64px; border-radius: 18px; display: inline-flex; align-items: center; justify-content: center; font-size: 30px; color: var(--black); background: linear-gradient(135deg, #c5ff6e, #5a8f1f); box-shadow: 0 0 40px rgba(180,249,83,.25); }
+  h1 { margin: 20px 0 0; font-size: 48px; font-weight: 800; letter-spacing: -0.02em; }
+  h1 span { color: var(--green); text-shadow: 0 0 40px rgba(180,249,83,.3); }
+  .hero p { margin: 14px auto 0; max-width: 540px; color: var(--muted); font-size: 16px; line-height: 1.6; }
+  .status { display: inline-flex; align-items: center; gap: 8px; margin-top: 18px; padding: 6px 14px; border-radius: 9999px; border: 1px solid #2d3a1a; background: var(--olive); color: var(--green); font-size: 13px; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 9999px; background: var(--green); box-shadow: 0 0 10px rgba(180,249,83,.6); }
+  .actions { margin-top: 26px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; padding: 11px 22px; border-radius: 9999px; font-weight: 600; font-size: 14px; text-decoration: none; transition: all .2s; }
+  .pill-primary { background: var(--green); color: var(--black); }
+  .pill-primary:hover { background: #c5ff6e; box-shadow: 0 0 20px rgba(180,249,83,.3); }
+  .pill-secondary { background: var(--border); color: var(--white); }
+  .pill-secondary:hover { background: #333; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 44px; }
+  .stat { background: linear-gradient(180deg, #171717, #131313); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .stat .k { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .stat .v { font-size: 24px; font-weight: 800; margin-top: 4px; }
+  .stat .v.acc { color: var(--green); }
+  .card { background: var(--dark); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 16px; }
+  h2 { margin: 0 0 14px; font-size: 16px; font-weight: 700; }
+  .kv { display: grid; grid-template-columns: 120px 1fr; gap: 10px 16px; font-size: 14px; }
+  .kv dt { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); align-self: center; }
+  .kv dd { margin: 0; word-break: break-all; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; background: var(--lc-green); color: var(--lc-black); margin-left: 8px; }
-  ul { list-style: none; padding: 0; margin: 0; }
-  ul li { padding: 4px 0; font-size: 12px; color: var(--lc-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  footer { margin-top: 48px; text-align: center; color: var(--lc-muted); font-size: 12px; }
-  footer a { color: var(--lc-muted); text-decoration: underline; }
+  .relays { display: flex; flex-wrap: wrap; gap: 8px; }
+  .relay { padding: 5px 12px; border-radius: 9999px; background: #0f0f0f; border: 1px solid var(--border); color: var(--muted); }
+  footer { margin-top: 40px; text-align: center; color: var(--muted); font-size: 13px; }
+  footer a { color: var(--muted); text-decoration: none; margin: 0 6px; }
+  footer a:hover { color: var(--green); }
+  @media (max-width: 640px) { h1 { font-size: 36px; } .stats { grid-template-columns: repeat(2, 1fr); } .kv { grid-template-columns: 1fr; gap: 2px; } .kv dd { margin-bottom: 8px; } }
 </style>
 </head>
 <body>
 <main>
+  <div class="orb"></div>
   <section class="hero">
-    <h1>Obelisk <span class="acc">SFU</span></h1>
-    <p>Mediasoup-backed selective forwarding unit for Obelisk voice/video rooms. Nostr-signaled, allow-listed, operator-run.</p>
-    <a class="pill" href="/admin">Open admin</a>
-    <a class="pill secondary" href="/info">Service info (JSON)</a>
+    <div class="mark">◉</div>
+    <h1>Obelisk <span>SFU</span></h1>
+    <p>The mediasoup selective forwarding unit behind Obelisk voice and video rooms. Nostr-signaled, allow-listed, operator-run.</p>
+    <div class="status"><span class="dot"></span> Online · up ${escape(uptimeLabel)}</div>
+    <div class="actions">
+      <a class="pill pill-primary" href="/admin">Operator console</a>
+      <a class="pill pill-secondary" href="/info">Service info (JSON)</a>
+    </div>
+  </section>
+
+  <section class="stats">
+    <div class="stat"><div class="k">Active rooms</div><div class="v ${this.deps.rooms.size() > 0 ? 'acc' : ''}">${this.deps.rooms.size()}</div></div>
+    <div class="stat"><div class="k">Voice channels</div><div class="v">${channels.voiceChannels}</div></div>
+    <div class="stat"><div class="k">Per room</div><div class="v">${cfg.maxParticipantsPerRoom}</div></div>
+    <div class="stat"><div class="k">Max rooms</div><div class="v">${cfg.maxRooms}</div></div>
   </section>
 
   <section class="card">
-    <h2>Identity <span class="badge">live</span></h2>
-    <div class="kv">
-      <div>Pubkey</div><div class="mono">${escape(this.deps.sfuPubkey)}</div>
-      <div>Operator</div><div class="mono">${escape(ops)}</div>
-      <div>Public URL</div><div class="mono">${escape(cfg.publicUrl ?? '—')}</div>
-      <div>Region</div><div class="mono">${escape(cfg.region ?? '—')}</div>
-      <div>Engine</div><div class="mono">${escape(cfg.engine)}</div>
-      <div>Capacity</div><div class="mono">${cfg.maxParticipantsPerRoom}/room · ${cfg.maxRooms} rooms</div>
-      <div>Active rooms</div><div class="mono">${this.deps.rooms.size()}</div>
-      <div>Voice channels</div><div class="mono">${this.deps.channels.getStatus().voiceChannels}</div>
-      <div>Uptime</div><div class="mono">${uptime}s</div>
-    </div>
+    <h2>Identity</h2>
+    <dl class="kv">
+      <dt>Pubkey</dt><dd class="mono">${escape(this.deps.sfuPubkey)}</dd>
+      <dt>Operator</dt><dd class="mono">${escape(ops)}</dd>
+      <dt>Public URL</dt><dd class="mono">${escape(cfg.publicUrl ?? '—')}</dd>
+      <dt>Region</dt><dd>${escape(cfg.region ?? '—')}</dd>
+      <dt>Engine</dt><dd>${escape(cfg.engine)}</dd>
+    </dl>
   </section>
 
   <section class="card">
     <h2>Relays</h2>
-    <ul>
-      ${cfg.relays.map((r) => `<li>· ${escape(r)}</li>`).join('')}
-    </ul>
+    <div class="relays">${cfg.relays.map((r) => `<span class="relay mono">${escape(r)}</span>`).join('')}</div>
   </section>
 
   <footer>
-    Operator-run service · <a href="/info">/info</a> · <a href="/healthz">/healthz</a> · <a href="/rooms">/rooms</a> · <a href="/channels">/channels</a>
+    Operator-run service ·
+    <a href="/info">/info</a><a href="/healthz">/healthz</a><a href="/rooms">/rooms</a><a href="/channels">/channels</a>
   </footer>
 </main>
 </body>

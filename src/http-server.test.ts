@@ -15,12 +15,22 @@ test('unknown channels retain the requested fallback engine', () => {
   assert.equal(testPeerModeForChannel(null), 'sfu');
 });
 
-test("admin access manager shows profile-rich npub controls without trusted-relay input", () => {
-  const html = readFileSync(new URL("../admin-ui/index.html", import.meta.url), "utf8");
-  assert.match(html, /id="allowed-list"/);
-  assert.match(html, /id="referent-list"/);
-  assert.match(html, /SimplePool/);
-  assert.match(html, /nip19\.decode/);
-  assert.match(html, /profile.picture/);
-  assert.doesNotMatch(html, /id="i-trusted"/);
+test('admin console resolves people from npub/hex/NIP-05 with Nostr profiles', () => {
+  const access = readFileSync(new URL('../admin-ui/src/components/Access.tsx', import.meta.url), 'utf8');
+  const profiles = readFileSync(new URL('../admin-ui/src/profiles.ts', import.meta.url), 'utf8');
+  assert.match(access, /nip19\.decode/);
+  assert.match(access, /well-known\/nostr\.json/);
+  assert.match(access, /trustedReferentPubkeys/);
+  assert.match(profiles, /SimplePool/);
+  assert.match(profiles, /picture/);
+  assert.doesNotMatch(access, /trustedAuthorRelays/);
+});
+
+test('admin console signs in through the nostr-wot-sdk login modal and a NIP-98 session', () => {
+  const login = readFileSync(new URL('../admin-ui/src/components/Login.tsx', import.meta.url), 'utf8');
+  const auth = readFileSync(new URL('../admin-ui/src/auth.ts', import.meta.url), 'utf8');
+  assert.match(login, /LoginModal/);
+  assert.match(login, /'nip07', 'nip46', 'import'/);
+  assert.match(auth, /kind: 27235/);
+  assert.match(auth, /\/admin\/session/);
 });

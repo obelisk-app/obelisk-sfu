@@ -13,3 +13,7 @@ runtime.json
 scripts/.test-peer/
 scripts/.test-peer-ms/
 scripts/.test-peer-mesh/
+
+# Admin console sessions (hashed tokens) + console build deps.
+admin-sessions.json
+admin-ui/node_modules
