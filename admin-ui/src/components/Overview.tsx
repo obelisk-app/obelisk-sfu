@@ -42,13 +42,9 @@ export function Overview({ snap, onTestTarget }: { snap: Snapshot; onTestTarget:
 
   return (
     <div>
-      <div class="mb-6">
-        <p class="text-xs font-bold uppercase tracking-[0.18em] text-lc-green mb-1">Overview</p>
-        <h1 class="text-3xl font-extrabold tracking-tight">Media server</h1>
-        <p class="text-sm text-lc-muted mt-1">
-          {snap.publicUrl ?? 'no public URL'} · {snap.region ?? 'no region'} · {snap.engine} engine · up {uptime}
-        </p>
-      </div>
+      <p class="text-sm text-lc-muted mb-6">
+        {snap.publicUrl ?? 'no public URL'} · {snap.region ?? 'no region'} · {snap.engine} engine · up {uptime}
+      </p>
 
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <Stat label="Active rooms" value={snap.activeRooms.length} hint={`of ${snap.maxRooms} max`} accent={snap.activeRooms.length > 0} />

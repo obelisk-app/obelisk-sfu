@@ -72,12 +72,6 @@ export function Access({ snap, onChange }: { snap: Snapshot; onChange: (s: Snaps
 
   return (
     <div>
-      <div class="mb-6">
-        <p class="text-xs font-bold uppercase tracking-[0.18em] text-lc-green mb-1">Access</p>
-        <h1 class="text-3xl font-extrabold tracking-tight">Who can start calls</h1>
-        <p class="text-sm text-lc-muted mt-1">Changes apply immediately — no restart needed.</p>
-      </div>
-
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <Stat label="Mode" value={mode === 'open' ? 'Open' : mode === 'bypass' ? 'Bypass' : 'Whitelist'}
           accent={mode === 'whitelist'} hint={mode === 'whitelist' ? 'enforced' : 'anyone can start calls'} />

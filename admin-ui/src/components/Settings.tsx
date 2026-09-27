@@ -104,12 +104,6 @@ export function Settings({ snap, onChange }: { snap: Snapshot; onChange: (s: Sna
 
   return (
     <div>
-      <div class="mb-6">
-        <p class="text-xs font-bold uppercase tracking-[0.18em] text-lc-green mb-1">Settings</p>
-        <h1 class="text-3xl font-extrabold tracking-tight">Configuration</h1>
-        <p class="text-sm text-lc-muted mt-1">Saved to <code class="text-lc-green">runtime.json</code>. Relay changes need a restart; everything else applies live.</p>
-      </div>
-
       <form onSubmit={save}>
         <Section title="Network">
           <div class="grid gap-4 md:grid-cols-2">

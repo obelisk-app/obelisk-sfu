@@ -59,14 +59,6 @@ export function TestPeers({ snap, onChange }: { snap: Snapshot; onChange: () => 
 
   return (
     <div>
-      <div class="mb-6">
-        <p class="text-xs font-bold uppercase tracking-[0.18em] text-lc-green mb-1">Test peers</p>
-        <h1 class="text-3xl font-extrabold tracking-tight">Synthetic callers</h1>
-        <p class="text-sm text-lc-muted mt-1">
-          Spawn an ffmpeg-driven peer into a voice channel to test media without a second person.
-        </p>
-      </div>
-
       <div class="grid lg:grid-cols-[1.1fr_1fr] gap-6 items-start">
         <Section title="Spawn a test peer">
           <form class="space-y-4" onSubmit={spawn}>
