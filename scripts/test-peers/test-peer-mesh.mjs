@@ -39,7 +39,7 @@ import {
   MediaStreamTrack,
   RtpPacket,
 } from 'werift';
-import { normalizeMeshSignal } from './mesh-signal.mjs';
+import { bindSession, normalizeMeshSignal, parsePresenceBeacon, supersedes } from './mesh-signal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const stateDir = path.join(__dirname, '..', '.test-peer-mesh');
@@ -96,11 +96,17 @@ const ICE_PORT_RANGE = ICE_PORT_MIN !== null && ICE_PORT_MAX !== null && ICE_POR
   : null;
 const MAX_LIFETIME_SEC = Math.max(60, Number(process.env.TEST_PEER_MAX_LIFETIME_SEC) || 1800);
 const PUBLISH_PROFILE = (process.env.TEST_PEER_PUBLISH_PROFILE ?? '1') !== '0';
-const PRESENCE_TTL_SECONDS = 45;
+// Mirrors obelisk-dex `src/constants/voice/*` and docs/features/voice/mesh-protocol.md.
+const PRESENCE_TTL_SECONDS = 150;
+const PRESENCE_SWEEP_MS = 10_000;
+const LEAVE_EXPIRATION_SECONDS = 10;
 const BEACON_INTERVAL_MS = 10_000;
+const BEACON_BRINGUP_DELAYS_MS = [300, 900, 1800, 3500, 7000, 12000, 18000];
+const BEACON_DEBOUNCE_MS = 250;
 const CONTROL_CHANNEL_LABEL = 'obelisk-control';
 const CONTROL_PING_INTERVAL_MS = 2_500;
 const CONTROL_PEER_SNAPSHOT_INTERVAL_MS = 5_000;
+const DEAD_PEER_TIMEOUT_MS = 20_000;
 
 function parseOptionalPort(raw) {
   const value = (raw ?? '').trim();
@@ -252,11 +258,20 @@ const ICE_SERVERS = [
   ...TURN_URLS.map((url) => ({ urls: url, username: TURN_USERNAME, credential: TURN_CREDENTIAL })),
 ];
 
+// Read by callbacks that can fire before the startup code below finishes.
+let shuttingDown = false;
+
 const peers = new Map();
 const connectedPubkeys = new Set();
 const rosterLatest = new Map();
 const seenSignalIds = new Set();
+const SEEN_SIGNAL_IDS_MAX = 2048;
 
+/**
+ * First-hand peers only: our own PCs and publishers of live beacons we
+ * received. Second-hand claims are never re-advertised (they kept departed
+ * pubkeys alive between clients).
+ */
 function knownPubkeys() {
   const out = new Set();
   for (const pk of connectedPubkeys) out.add(pk);
@@ -266,24 +281,29 @@ function knownPubkeys() {
   return Array.from(out).sort();
 }
 
+function isCurrent(state) {
+  return peers.get(state.remotePubkey) === state;
+}
+
 function sendControl(state, msg) {
   const dc = state.controlChannel;
-  if (!dc || dc.readyState !== 'open') return;
-  try { dc.send(JSON.stringify(msg)); }
-  catch (err) { console.warn('[mesh] control send failed', state.remotePubkey.slice(0, 8), err.message); }
+  if (!dc || dc.readyState !== 'open') return false;
+  try { dc.send(JSON.stringify(msg)); return true; }
+  catch (err) { console.warn('[mesh] control send failed', state.remotePubkey.slice(0, 8), err.message); return false; }
 }
 
 function sendControlSnapshot(state) {
   sendControl(state, { type: 'peerSnapshot', peers: knownPubkeys(), ts: Date.now() });
 }
 
-function broadcastControl(msg) {
-  for (const state of peers.values()) sendControl(state, msg);
+function broadcastControl(msg, except) {
+  for (const state of peers.values()) if (state !== except) sendControl(state, msg);
 }
 
 function closeControl(state) {
   if (state.controlPingTimer) { clearInterval(state.controlPingTimer); state.controlPingTimer = null; }
   if (state.controlSnapshotTimer) { clearInterval(state.controlSnapshotTimer); state.controlSnapshotTimer = null; }
+  if (state.deadTimer) { clearTimeout(state.deadTimer); state.deadTimer = null; }
   const dc = state.controlChannel;
   state.controlChannel = null;
   if (dc && dc.readyState === 'open') {
@@ -291,7 +311,36 @@ function closeControl(state) {
   }
 }
 
+/**
+ * Close one connection. Idempotent, and a no-op on the map when `state` has
+ * already been replaced, so callbacks from a torn-down PC cannot touch the
+ * one that replaced it.
+ */
+function tearDown(state, reason) {
+  if (state.closed) return;
+  state.closed = true;
+  console.log('[mesh] tear down', state.remotePubkey.slice(0, 8), reason);
+  closeControl(state);
+  try { state.pc.close(); } catch { /* ignore */ }
+  if (!isCurrent(state)) return;
+  peers.delete(state.remotePubkey);
+  if (connectedPubkeys.delete(state.remotePubkey)) {
+    broadcastControl({ type: 'peerRemoved', pubkey: state.remotePubkey });
+  }
+  scheduleBeacon();
+}
+
+function armDeadTimer(state) {
+  if (state.deadTimer) clearTimeout(state.deadTimer);
+  state.deadTimer = setTimeout(() => {
+    state.deadTimer = null;
+    tearDown(state, 'heartbeat-lost');
+  }, DEAD_PEER_TIMEOUT_MS);
+  state.deadTimer.unref?.();
+}
+
 function handleControlMessage(state, raw) {
+  if (state.closed) return;
   let msg;
   try {
     const data = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw ?? '');
@@ -300,9 +349,13 @@ function handleControlMessage(state, raw) {
     return;
   }
   if (!msg || typeof msg.type !== 'string') return;
+  armDeadTimer(state);
   if (msg.type === 'hello' || msg.type === 'peerSnapshot') {
+    if (msg.type === 'hello') state.remoteSignals = msg.signalTransport === 1;
     const hinted = Array.isArray(msg.peers) ? msg.peers : [];
     for (const pk of hinted) createPeer(pk);
+  } else if (msg.type === 'signal' && msg.payload && typeof msg.payload.type === 'string') {
+    if (state.remoteSignals) void handleSignal(state.remotePubkey, msg.payload);
   } else if (msg.type === 'peerAdded' && typeof msg.pubkey === 'string') {
     createPeer(msg.pubkey);
   } else if (msg.type === 'peerRemoved' && typeof msg.pubkey === 'string') {
@@ -312,26 +365,25 @@ function handleControlMessage(state, raw) {
   } else if (msg.type === 'ping') {
     sendControl(state, { type: 'pong', ts: Date.now(), echoTs: msg.ts ?? Date.now() });
   } else if (msg.type === 'bye') {
-    console.log('[mesh] control bye from', state.remotePubkey.slice(0, 8), msg.reason ?? 'remote-bye');
-    closeControl(state);
-    try { state.pc.close(); } catch { /* ignore */ }
-    peers.delete(state.remotePubkey);
-    connectedPubkeys.delete(state.remotePubkey);
+    tearDown(state, 'control bye: ' + (msg.reason ?? 'remote-bye'));
   }
 }
 
 function attachControlChannel(state, dc) {
   if (!dc || dc.label !== CONTROL_CHANNEL_LABEL) return;
-  if (state.controlChannel) return;
+  if (state.controlChannel || state.closed) return;
   state.controlChannel = dc;
   dc.onopen = () => {
+    if (state.closed) return;
     console.log('[mesh] control open to', state.remotePubkey.slice(0, 8));
     sendControl(state, {
       type: 'hello',
       peers: knownPubkeys(),
       sessionId: state.sessionId,
       build: 'obelisk-mesh-test-peer',
+      signalTransport: 1,
     });
+    armDeadTimer(state);
     state.controlPingTimer = setInterval(() => {
       sendControl(state, { type: 'ping', ts: Date.now() });
     }, CONTROL_PING_INTERVAL_MS);
@@ -350,32 +402,43 @@ function attachControlChannel(state, dc) {
   if (dc.readyState === 'open') dc.onopen?.();
 }
 
-async function sendSignal(toPubkey, payload) {
+/**
+ * Send one signal to the peer of `state`. Stamped with our session, the
+ * remote session it answers, and a sequence number. Rides the data channel
+ * once it is open and the remote advertised `signalTransport: 1`, as the
+ * browser does; otherwise (initial SDP, legacy peers) a signed kind 25050.
+ */
+async function sendSignal(state, payload, { relayOnly = false } = {}) {
+  const signal = {
+    ...payload,
+    sessionId: state.sessionId,
+    ...(state.remoteSessionId ? { targetSessionId: state.remoteSessionId } : {}),
+    seq: ++state.outboundSeq,
+  };
+  if (!relayOnly && state.connected && state.remoteSignals
+    && sendControl(state, { type: 'signal', payload: signal })) {
+    return;
+  }
   await publish({
     kind: 25050,
-    content: JSON.stringify(payload),
+    content: JSON.stringify(signal),
     tags: [
-      ['p', toPubkey],
+      ['p', state.remotePubkey],
       ['e', CHANNEL_ID],
       ['t', 'obelisk-voice-signal'],
     ],
-  }, 'signal ' + payload.type);
+  }, 'signal ' + signal.type);
 }
 
 async function makeOffer(state, reason) {
   const { pc, remotePubkey } = state;
-  if (state.makingOffer || pc.signalingState !== 'stable') return;
+  if (state.closed || state.makingOffer || pc.signalingState !== 'stable') return;
   try {
     state.makingOffer = true;
     await pc.setLocalDescription();
-    if (!pc.localDescription) return;
+    if (!pc.localDescription || state.closed) return;
     console.log('[mesh] -> offer to', remotePubkey.slice(0, 8), 'reason=', reason, 'sdp=', pc.localDescription.sdp.length);
-    await sendSignal(remotePubkey, {
-      type: 'peer',
-      peerSignal: { type: 'offer', sdp: pc.localDescription.sdp },
-      sessionId: state.sessionId,
-      seq: ++state.outboundSeq,
-    });
+    await sendSignal(state, { type: 'peer', peerSignal: { type: 'offer', sdp: pc.localDescription.sdp } });
   } catch (err) {
     console.warn('[mesh] makeOffer threw', err.message);
   } finally {
@@ -383,16 +446,19 @@ async function makeOffer(state, reason) {
   }
 }
 
-function createPeer(remotePubkey, options = {}) {
-  if (!remotePubkey || remotePubkey === pubkey) return null;
+function createPeer(remotePubkey) {
+  if (shuttingDown || !remotePubkey || remotePubkey === pubkey) return null;
+  if (!/^[0-9a-f]{64}$/.test(remotePubkey)) return null;
   const existing = peers.get(remotePubkey);
   if (existing) return existing;
 
-  const remotePresence = rosterLatest.get(remotePubkey);
-  const remoteIsMeshTestPeer = remotePresence?.isMeshTestPeer === true;
-  const polite = options.forceImpolite ? false : (remoteIsMeshTestPeer ? pubkey > remotePubkey : true);
+  // Browsers always take the initiator role toward a marked mesh test peer
+  // (`mesh-peer.ts`), so we answer. Between two test peers the browsers'
+  // lexicographic rule applies: the smaller pubkey initiates.
+  const remoteIsMeshTestPeer = rosterLatest.get(remotePubkey)?.isMeshTestPeer === true;
+  const polite = remoteIsMeshTestPeer ? pubkey > remotePubkey : true;
   console.log('[mesh] open PC to', remotePubkey.slice(0, 8), 'polite=', polite,
-    options.forceImpolite ? '(reset-driver)' : remoteIsMeshTestPeer ? '(mesh-test-peer)' : '(browser-driven)');
+    remoteIsMeshTestPeer ? '(mesh-test-peer)' : '(browser-driven)');
 
   const pc = new RTCPeerConnection({
     iceServers: ICE_SERVERS,
@@ -408,12 +474,17 @@ function createPeer(remotePubkey, options = {}) {
     polite,
     makingOffer: false,
     sessionId: randomUUID().slice(0, 8),
+    remoteSessionId: null,
+    remoteSignals: false,
+    connected: false,
+    closed: false,
     outboundSeq: 0,
     signalQueue: Promise.resolve(),
     tx: [],
     controlChannel: null,
     controlPingTimer: null,
     controlSnapshotTimer: null,
+    deadTimer: null,
   };
   peers.set(remotePubkey, state);
 
@@ -444,69 +515,79 @@ function createPeer(remotePubkey, options = {}) {
   }
 
   pc.onIceCandidate.subscribe(async (candidate) => {
-    if (!candidate) return;
-    await sendSignal(remotePubkey, {
-      type: 'peer',
-      peerSignal: { type: 'candidate', candidate: candidate.toJSON() },
-      sessionId: state.sessionId,
-      seq: ++state.outboundSeq,
-    });
+    if (!candidate || state.closed) return;
+    await sendSignal(state, { type: 'peer', peerSignal: { type: 'candidate', candidate: candidate.toJSON() } });
   });
 
   pc.connectionStateChange.subscribe((s) => {
     console.log('[mesh] PC ->', remotePubkey.slice(0, 8), 'connectionState=', s);
+    if (state.closed || !isCurrent(state)) return;
     if (s === 'connected') {
-      const isNew = !connectedPubkeys.has(remotePubkey);
-      connectedPubkeys.add(remotePubkey);
-      if (isNew) broadcastControl({ type: 'peerAdded', pubkey: remotePubkey });
-      for (const other of peers.values()) sendControlSnapshot(other);
-      void publishBeacon().catch(() => undefined);
-    }
-    if (s === 'closed' || s === 'failed' || s === 'disconnected') {
-      const had = connectedPubkeys.delete(remotePubkey);
-      if (had) broadcastControl({ type: 'peerRemoved', pubkey: remotePubkey });
-      if (s === 'closed' || s === 'failed') {
-        closeControl(state);
-        peers.delete(remotePubkey);
+      state.connected = true;
+      if (!connectedPubkeys.has(remotePubkey)) {
+        connectedPubkeys.add(remotePubkey);
+        broadcastControl({ type: 'peerAdded', pubkey: remotePubkey }, state);
       }
       for (const other of peers.values()) sendControlSnapshot(other);
-      void publishBeacon().catch(() => undefined);
+      scheduleBeacon();
     }
+    if (s === 'disconnected') {
+      state.connected = false;
+      if (connectedPubkeys.delete(remotePubkey)) {
+        broadcastControl({ type: 'peerRemoved', pubkey: remotePubkey }, state);
+        scheduleBeacon();
+      }
+    }
+    if (s === 'closed' || s === 'failed') tearDown(state, 'pc ' + s);
   });
   pc.iceConnectionStateChange.subscribe((s) => {
     console.log('[mesh] PC ->', remotePubkey.slice(0, 8), 'iceConnectionState=', s);
   });
 
   setTimeout(async () => {
-    await sendSignal(remotePubkey, {
-      type: 'trackinfo',
-      trackInfo: { trackId: sharedVideoTrack.uuid, kind: 'camera' },
-      sessionId: state.sessionId,
-      seq: ++state.outboundSeq,
-    });
-    await sendSignal(remotePubkey, {
-      type: 'trackinfo',
-      trackInfo: { trackId: sharedAudioTrack.uuid, kind: 'audio' },
-      sessionId: state.sessionId,
-      seq: ++state.outboundSeq,
-    });
+    if (state.closed) return;
+    await sendSignal(state, { type: 'trackinfo', trackInfo: { trackId: sharedVideoTrack.uuid, kind: 'camera' } });
+    await sendSignal(state, { type: 'trackinfo', trackInfo: { trackId: sharedAudioTrack.uuid, kind: 'audio' } });
   }, 50);
 
   return state;
 }
 
-async function handleSignal(fromPubkey, payload) {
-  payload = normalizeMeshSignal(payload);
-  if (!payload) return;
-  const state = createPeer(fromPubkey);
+async function handleSignal(fromPubkey, rawPayload) {
+  if (shuttingDown) return;
+  let state = peers.get(fromPubkey);
+  // A bye or reset for a connection we no longer hold has nothing to close.
+  if (!state && (rawPayload?.type === 'bye' || rawPayload?.type === 'requestReset')) return;
+  state = state ?? createPeer(fromPubkey);
   if (!state) return;
   const previousSignal = state.signalQueue;
   let releaseSignal = () => {};
   state.signalQueue = new Promise((resolve) => { releaseSignal = resolve; });
   await previousSignal;
-  const { pc } = state;
   try {
-    if (payload.sessionId) state.remoteSessionId = payload.sessionId;
+    if (state.closed) {
+      // Closed while this signal waited its turn: hand it to the PC that
+      // replaced it, or let a fresh offer open one.
+      const next = peers.get(fromPubkey);
+      if (next ? next !== state : normalizeMeshSignal(rawPayload)?.type === 'offer') {
+        await handleSignal(fromPubkey, rawPayload);
+      }
+      return;
+    }
+    const verdict = bindSession(state, rawPayload);
+    if (verdict === 'drop') {
+      console.log('[mesh] drop', rawPayload.type, 'from stale session of', fromPubkey.slice(0, 8));
+      return;
+    }
+    if (verdict === 'replace') {
+      // An offer under a new session: the remote rebuilt its side.
+      tearDown(state, 'remote session changed');
+      await handleSignal(fromPubkey, rawPayload);
+      return;
+    }
+    const payload = normalizeMeshSignal(rawPayload);
+    if (!payload) return;
+    const { pc } = state;
 
     if (payload.type === 'offer' && payload.sdp) {
       const offerCollision = state.makingOffer || pc.signalingState !== 'stable';
@@ -515,23 +596,14 @@ async function handleSignal(fromPubkey, payload) {
         return;
       }
       if (offerCollision && pc.signalingState === 'have-local-offer') {
-        console.log('[mesh] reset polite peer on offer glare from', fromPubkey.slice(0, 8));
-        closeControl(state);
-        try { pc.close(); } catch { /* ignore */ }
-        peers.delete(fromPubkey);
-        connectedPubkeys.delete(fromPubkey);
-        await handleSignal(fromPubkey, payload);
+        tearDown(state, 'offer glare (polite)');
+        await handleSignal(fromPubkey, rawPayload);
         return;
       }
       await pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
       const answer = await pc.createAnswer();
       console.log('[mesh] -> answer to', fromPubkey.slice(0, 8), 'sdp=', answer.sdp.length);
-      await sendSignal(fromPubkey, {
-        type: 'peer',
-        peerSignal: { type: 'answer', sdp: answer.sdp },
-        sessionId: state.sessionId,
-        seq: ++state.outboundSeq,
-      });
+      await sendSignal(state, { type: 'peer', peerSignal: { type: 'answer', sdp: answer.sdp } });
       await pc.setLocalDescription(answer);
     } else if (payload.type === 'answer' && payload.sdp) {
       if (pc.signalingState === 'have-local-offer') {
@@ -546,19 +618,13 @@ async function handleSignal(fromPubkey, payload) {
         catch (err) { console.warn('[mesh] addIceCandidate failed', err.message); }
       }
     } else if (payload.type === 'bye') {
-      console.log('[mesh] relay bye from', fromPubkey.slice(0, 8), payload.byeReason ?? 'remote-bye');
-      closeControl(state);
-      try { pc.close(); } catch { /* ignore */ }
-      peers.delete(fromPubkey);
-      connectedPubkeys.delete(fromPubkey);
-      void publishBeacon().catch(() => undefined);
+      tearDown(state, 'relay bye: ' + (payload.byeReason ?? 'remote-bye'));
     } else if (payload.type === 'requestReset') {
-      console.log('[mesh] requestReset from', fromPubkey.slice(0, 8));
-      closeControl(state);
-      try { pc.close(); } catch { /* ignore */ }
-      peers.delete(fromPubkey);
-      connectedPubkeys.delete(fromPubkey);
-      createPeer(fromPubkey, { forceImpolite: true });
+      // The remote already rebuilt its side. A browser (always the
+      // initiator toward us) follows with a fresh offer; between test
+      // peers the initiator re-dials.
+      tearDown(state, 'requestReset');
+      if (!state.polite) createPeer(fromPubkey);
     }
   } catch (err) {
     console.warn('[mesh] handleSignal threw', err.message);
@@ -567,81 +633,69 @@ async function handleSignal(fromPubkey, payload) {
   }
 }
 
-function eventHasTag(ev, name, value) {
-  return ev.tags.some((t) => t[0] === name && t[1] === value);
-}
-
 function pruneRoster() {
   const now = Math.floor(Date.now() / 1000);
   for (const [pk, entry] of Array.from(rosterLatest.entries())) {
     if (entry.expiresAt > now) continue;
     rosterLatest.delete(pk);
-    if (!connectedPubkeys.has(pk)) {
-      const peer = peers.get(pk);
-      if (peer) {
-        closeControl(peer);
-        try { peer.pc.close(); } catch { /* ignore */ }
-        peers.delete(pk);
-      }
-    }
+    const peer = peers.get(pk);
+    if (peer && !connectedPubkeys.has(pk)) tearDown(peer, 'presence expired');
   }
 }
 
 function upsertRosterBeacon(ev) {
   if (ev.pubkey === pubkey) return;
-  if (!eventHasTag(ev, 'e', CHANNEL_ID)) return;
-  if (!eventHasTag(ev, 't', 'obelisk-voice-presence')) return;
-  if (eventHasTag(ev, 'sfu', '1')) return;
-  const expirationTag = ev.tags.find((t) => t[0] === 'expiration')?.[1];
-  const expiresAt = expirationTag ? parseInt(expirationTag, 10) || 0 : ev.created_at + PRESENCE_TTL_SECONDS;
-  if (!Number.isFinite(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return;
-  const prev = rosterLatest.get(ev.pubkey);
-  if (prev && prev.createdAt >= ev.created_at) return;
-  const hintedSet = new Set();
-  for (const t of ev.tags) {
-    if ((t[0] === 'p' || t[0] === 'peer') && typeof t[1] === 'string' && t[1] && t[1] !== pubkey) {
-      hintedSet.add(t[1]);
-    }
+  const beacon = parsePresenceBeacon(ev, { channelId: CHANNEL_ID, ttlSeconds: PRESENCE_TTL_SECONDS });
+  if (!beacon || beacon.isSfu) return;
+  if (!supersedes(rosterLatest.get(ev.pubkey), beacon)) return;
+  if (beacon.terminal) {
+    // A leave beacon removes the publisher now, not after the old lease.
+    const known = rosterLatest.delete(ev.pubkey);
+    const peer = peers.get(ev.pubkey);
+    if (peer) tearDown(peer, 'presence left');
+    if (known || peer) scheduleBeacon();
+    return;
   }
-  const hinted = Array.from(hintedSet);
-  const isMeshTestPeer = eventHasTag(ev, 'client', 'obelisk-mesh-test-peer')
-    || eventHasTag(ev, 'test-peer', 'mesh');
-  rosterLatest.set(ev.pubkey, { createdAt: ev.created_at, expiresAt, peers: hinted, isMeshTestPeer });
-
-  console.log('[mesh] roster sees', ev.pubkey.slice(0, 8), hinted.length ? 'hints=' + hinted.length : '');
+  const isNew = !rosterLatest.has(ev.pubkey);
+  rosterLatest.set(ev.pubkey, beacon);
+  console.log('[mesh] roster sees', ev.pubkey.slice(0, 8), beacon.connectedTo.length ? 'connected=' + beacon.connectedTo.length : '');
   createPeer(ev.pubkey);
-  for (const pk of hinted) createPeer(pk);
+  for (const pk of beacon.connectedTo) if (pk !== pubkey) createPeer(pk);
+  if (isNew) scheduleBeacon();
   for (const state of peers.values()) sendControlSnapshot(state);
 }
 
 // Indexed filters (`#p` / `#e`): the relays ration tag-less "scrape" REQs
 // and close them when over budget — voice subscriptions must be targeted.
-subscribeResilient(pool, RELAYS, { kinds: [25050], '#p': [pubkey] }, {
+const signalSub = subscribeResilient(pool, RELAYS, { kinds: [25050], '#p': [pubkey] }, {
   label: 'signals',
   signer: signAuth,
-  sinceWindow: 30,
+  sinceWindow: 60,
   onevent: async (ev) => {
     if (seenSignalIds.has(ev.id)) return;
     seenSignalIds.add(ev.id);
+    if (seenSignalIds.size > SEEN_SIGNAL_IDS_MAX) seenSignalIds.delete(seenSignalIds.values().next().value);
     if (ev.pubkey === pubkey) return;
-    if (!eventHasTag(ev, 'e', CHANNEL_ID)) return;
+    if (!ev.tags.some((t) => t[0] === 'e' && t[1] === CHANNEL_ID)) return;
     const targeted = ev.tags.some((t) => t[0] === 'p' && t[1] === pubkey);
     if (!targeted) return;
     let payload;
     try { payload = JSON.parse(ev.content); } catch { return; }
+    if (!payload || typeof payload.type !== 'string') return;
     console.log('[mesh] <-', payload.type, 'from', ev.pubkey.slice(0, 8), 'seq=', payload.seq ?? '-');
     await handleSignal(ev.pubkey, payload);
   },
 });
 
-subscribeResilient(pool, RELAYS, { kinds: [20078], '#e': [CHANNEL_ID] }, {
+const rosterSub = subscribeResilient(pool, RELAYS, { kinds: [20078], '#e': [CHANNEL_ID] }, {
   label: 'roster',
   signer: signAuth,
-  sinceWindow: 60,
+  sinceWindow: PRESENCE_TTL_SECONDS,
   onevent: upsertRosterBeacon,
 });
 
 async function publishBeacon() {
+  if (shuttingDown) return;
   const tags = [
     ['e', CHANNEL_ID],
     ['t', 'obelisk-voice-presence'],
@@ -655,9 +709,22 @@ async function publishBeacon() {
   await publish({ kind: 20078, content: '', tags }, 'beacon');
   console.log('[mesh] beacon published connected=', connectedPubkeys.size, 'known=', knownPubkeys().length);
 }
+
+let beaconDebounce = null;
+function scheduleBeacon() {
+  if (shuttingDown || beaconDebounce) return;
+  beaconDebounce = setTimeout(() => {
+    beaconDebounce = null;
+    void publishBeacon().catch(() => undefined);
+  }, BEACON_DEBOUNCE_MS);
+}
+
 await publishBeacon();
+// Bring-up burst: an ephemeral beacon lost while the room's subscriptions
+// were still opening would otherwise cost a full steady-state tick.
+const bringupTimers = BEACON_BRINGUP_DELAYS_MS.map((ms) => setTimeout(() => { void publishBeacon().catch(() => undefined); }, ms));
 const beaconTimer = setInterval(() => { void publishBeacon().catch(() => undefined); }, BEACON_INTERVAL_MS);
-const pruneTimer = setInterval(pruneRoster, Math.floor(PRESENCE_TTL_SECONDS * 500));
+const pruneTimer = setInterval(pruneRoster, PRESENCE_SWEEP_MS);
 
 const startedAt = Date.now();
 const statsTimer = setInterval(() => {
@@ -669,18 +736,43 @@ const statsTimer = setInterval(() => {
   console.log('[mesh] status uptime=', uptime, 's peers=', peers.size, 'connected=', connectedPubkeys.size, 'rtp=', videoSink.getPacketCount() + '/' + audioSink.getPacketCount(), peerStats.join(' | ') || '-');
   if (uptime >= MAX_LIFETIME_SEC) {
     console.log('[mesh] reached max lifetime', MAX_LIFETIME_SEC, 's - exiting');
-    cleanup();
+    void cleanup();
   }
 }, 30_000);
 
-let shuttingDown = false;
-function cleanup() {
+async function publishLeave() {
+  await publish({
+    kind: 20078,
+    content: '',
+    tags: [
+      ['e', CHANNEL_ID],
+      ['t', 'obelisk-voice-presence'],
+      ['status', 'left'],
+      // In the future, not the past: a NIP-40 relay drops an already
+      // expired event before delivering it.
+      ['expiration', String(Math.floor(Date.now() / 1000) + LEAVE_EXPIRATION_SECONDS)],
+    ],
+  }, 'leave');
+}
+
+async function cleanup() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('[mesh] shutting down');
+  bringupTimers.forEach(clearTimeout);
+  if (beaconDebounce) clearTimeout(beaconDebounce);
   clearInterval(beaconTimer);
   clearInterval(pruneTimer);
   clearInterval(statsTimer);
+  const peerByes = Array.from(peers.values()).map((state) => {
+    const viaControl = sendControl(state, { type: 'bye', reason: 'local-leave' });
+    return viaControl ? null : sendSignal(state, { type: 'bye', byeReason: 'local-leave' }, { relayOnly: true });
+  });
+  // Bounded: a relay that never answers must not hold the process open.
+  await Promise.race([
+    Promise.allSettled([publishLeave(), ...peerByes]),
+    new Promise((resolve) => setTimeout(resolve, 3000)),
+  ]);
   try { ffv.kill('SIGTERM'); } catch { /* ignore */ }
   try { ffa.kill('SIGTERM'); } catch { /* ignore */ }
   try { videoSink.sock.close(); } catch { /* ignore */ }
@@ -689,10 +781,12 @@ function cleanup() {
     closeControl(state);
     try { state.pc.close(); } catch { /* ignore */ }
   }
+  signalSub.close();
+  rosterSub.close();
   try { pool.close(RELAYS); } catch { /* ignore */ }
   setTimeout(() => process.exit(0), 500);
 }
-process.on('SIGINT', cleanup);
-process.on('SIGTERM', cleanup);
+process.on('SIGINT', () => { void cleanup(); });
+process.on('SIGTERM', () => { void cleanup(); });
 
 console.log('[mesh] running. Ctrl-C to stop.');
