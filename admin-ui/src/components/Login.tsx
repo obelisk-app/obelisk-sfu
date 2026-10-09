@@ -155,7 +155,7 @@ export function Login({ onLogin, fresh = false }: { onLogin: (s: Session) => voi
           <h2 class="text-xl font-bold">Operator sign-in</h2>
           <p class="text-sm text-lc-muted mt-1 mb-6">
             Sign once with your Nostr identity to open a 12-hour session. Only this SFU's operator
-            key gets in; your key never leaves your signer.
+            and admin keys get in; your key never leaves your signer.
           </p>
 
           {error && (
@@ -193,7 +193,7 @@ export function Login({ onLogin, fresh = false }: { onLogin: (s: Session) => voi
           open={open}
           onClose={() => setOpen(false)}
           title="Sign in to Obelisk SFU"
-          subtitle="Use this SFU's operator Nostr key."
+          subtitle="Use this SFU's operator or an admin Nostr key."
           methods={['nip07', 'nip46', 'import']}
           methodIcons={LOGIN_METHOD_ICONS}
           flatLayout

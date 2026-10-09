@@ -29,6 +29,7 @@ import {
   AuthError,
   applyOverrides,
   effectiveOperator,
+  isConsoleAdmin,
   loadRuntimeOverrides,
   saveRuntimeOverrides,
   verifyNip98,
@@ -181,15 +182,16 @@ export class HttpServer {
   }
 
   private authOrFail(req: IncomingMessage, res: ServerResponse, method: string): string | null {
-    // Console session cookie first; the operator check is repeated on every
-    // request so changing the operator key revokes existing sessions.
-    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
+    // Console session cookie first; the admin check is repeated on every
+    // request so changing the operator key or removing an admin revokes
+    // their existing sessions.
+    const { cfg, sfuPubkey } = this.deps;
     const sessionPubkey = this.sessions.lookup(req.headers.cookie);
-    if (sessionPubkey && sessionPubkey === op) return sessionPubkey;
+    if (sessionPubkey && isConsoleAdmin(cfg, sfuPubkey, sessionPubkey)) return sessionPubkey;
     try {
       const pubkey = verifyNip98(req.headers.authorization, method, this.fullUrl(req));
-      if (pubkey !== op) {
-        json(res, 403, { error: 'not the operator', operator: op });
+      if (!isConsoleAdmin(cfg, sfuPubkey, pubkey)) {
+        json(res, 403, { error: 'not an admin of this SFU', operator: effectiveOperator(cfg, sfuPubkey) });
         return null;
       }
       return pubkey;
@@ -202,13 +204,14 @@ export class HttpServer {
 
   /** GET /admin/session — who (if anyone) the session cookie belongs to. */
   private handleSessionGet(req: IncomingMessage, res: ServerResponse): void {
-    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
     const pubkey = this.sessions.lookup(req.headers.cookie);
-    json(res, 200, pubkey && pubkey === op ? { authed: true, pubkey } : { authed: false });
+    json(res, 200, pubkey && isConsoleAdmin(this.deps.cfg, this.deps.sfuPubkey, pubkey)
+      ? { authed: true, pubkey }
+      : { authed: false });
   }
 
   /**
-   * POST /admin/session — exchange ONE NIP-98 signature (operator key) for
+   * POST /admin/session — exchange ONE NIP-98 signature (operator or admin key) for
    * an HttpOnly session cookie, so the console doesn't need a signature per
    * request (unworkable with NIP-46 remote signers).
    */
@@ -220,8 +223,12 @@ export class HttpServer {
       const e = err as AuthError;
       return json(res, e.status ?? 401, { error: e.message });
     }
-    const op = effectiveOperator(this.deps.cfg, this.deps.sfuPubkey);
-    if (pubkey !== op) return json(res, 403, { error: 'not the operator', operator: op });
+    if (!isConsoleAdmin(this.deps.cfg, this.deps.sfuPubkey, pubkey)) {
+      return json(res, 403, {
+        error: 'not an admin of this SFU',
+        operator: effectiveOperator(this.deps.cfg, this.deps.sfuPubkey),
+      });
+    }
     const { token, expiresAt } = this.sessions.issue(pubkey);
     res.setHeader('set-cookie', sessionCookie(token, { secure: this.isHttps(req) }));
     log.info('admin session opened', { pubkey: pubkey.slice(0, 8) });
@@ -274,6 +281,14 @@ export class HttpServer {
       for (const pk of patch.allowed) {
         if (!/^[0-9a-f]{64}$/i.test(pk)) {
           return json(res, 400, { error: `invalid allowed pubkey: ${pk}` });
+        }
+      }
+    }
+    if (patch.admins) {
+      if (!Array.isArray(patch.admins)) return json(res, 400, { error: 'admins must be an array' });
+      for (const pk of patch.admins) {
+        if (typeof pk !== 'string' || !/^[0-9a-f]{64}$/i.test(pk)) {
+          return json(res, 400, { error: `invalid admin pubkey: ${pk}` });
         }
       }
     }
@@ -440,6 +455,7 @@ export class HttpServer {
     return {
       pubkey: this.deps.sfuPubkey,
       operator: effectiveOperator(cfg, this.deps.sfuPubkey),
+      admins: [...cfg.adminPubkeys],
       relays: cfg.relays,
       trustedAuthorRelays: cfg.trustedAuthorRelays,
       allowed: [...cfg.allowedPubkeys],

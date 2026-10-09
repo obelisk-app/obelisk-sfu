@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'preact/hooks'
 import { nip19 } from 'nostr-tools'
 import { api, Snapshot } from '../api'
+import { useProfiles } from '../profiles'
+import { PeoplePanel } from './Access'
 import { toast } from './toast'
 import { Section, shortNpub } from './ui'
 
@@ -33,7 +35,7 @@ function toHex(input: string): string | null {
   throw new Error('Operator must be an npub or 64-char hex pubkey')
 }
 
-export function Settings({ snap, onChange }: { snap: Snapshot; onChange: (s: Snapshot) => void }) {
+export function Settings({ snap, me, onChange }: { snap: Snapshot; me?: string; onChange: (s: Snapshot) => void }) {
   // Seeded once: the 5 s live refresh must not clobber half-typed input.
   const [form, setForm] = useState<Form>(() => fromSnap(snap))
   const [busy, setBusy] = useState('')
@@ -50,6 +52,22 @@ export function Settings({ snap, onChange }: { snap: Snapshot; onChange: (s: Sna
   const set = (k: keyof Form) => (e: Event) => {
     setDirty(true)
     setForm((f) => ({ ...f, [k]: (e.target as HTMLInputElement).value }))
+  }
+
+  const adminProfiles = useProfiles(snap.admins)
+  const patchAdmins = async (admins: string[], ok: string, key: string) => {
+    setBusy(key)
+    try {
+      const { state } = await api.patch({ admins })
+      onChange(state)
+      toast.ok(ok)
+      return true
+    } catch (err) {
+      toast.err((err as Error).message)
+      return false
+    } finally {
+      setBusy('')
+    }
   }
 
   const relaysChanged = lines(form.relays).join('\n') !== snap.relays.join('\n')
@@ -129,7 +147,7 @@ export function Settings({ snap, onChange }: { snap: Snapshot; onChange: (s: Sna
             <span class="text-yellow-300">⚠ Changing this locks you out unless you control the new key.</span>)}
         </Section>
 
-        <div class="flex flex-wrap items-center gap-3 mb-10">
+        <div class="flex flex-wrap items-center gap-3 mb-6">
           <button class="lc-pill-primary" disabled={!!busy || !dirty}>
             {busy === 'save' ? <span class="lc-spinner !w-4 !h-4" /> : dirty ? 'Save changes' : 'Saved'}
           </button>
@@ -141,6 +159,23 @@ export function Settings({ snap, onChange }: { snap: Snapshot; onChange: (s: Sna
           </button>
         </div>
       </form>
+
+      <PeoplePanel
+        title="Admins"
+        subtitle="Can sign in to this console with full access, alongside the operator. Applies immediately."
+        field="admins"
+        list={snap.admins}
+        profiles={adminProfiles}
+        busy={busy}
+        onAdd={async (pk) => {
+          if (pk === snap.operator) { toast.ok('That key is already the operator'); return true }
+          return patchAdmins([...snap.admins, pk], 'Admin added', 'add-admins')
+        }}
+        onRemove={(pk) => patchAdmins(snap.admins.filter((x) => x !== pk), 'Admin removed', 'remove-admins')}
+        removeConfirm={(pk, name) => pk === me
+          ? `Remove yourself (${name}) as admin? You'll be signed out of this console.`
+          : `Remove ${name} as admin?`}
+      />
     </div>
   )
 }

@@ -6,7 +6,7 @@
  * request's HTTP method + URL, base64-encode it, and pass it as
  * `Authorization: Nostr <b64>`. The pubkey on that event must equal the
  * SFU's operator pubkey (`SFU_OPERATOR_PUBKEY`, defaults to the SFU's own
- * pubkey when unset).
+ * pubkey when unset) or one of the console admins (`admins`).
  *
  * Persistence: changes are written to `runtime.json` (sibling of `.env`),
  * which is layered on top of env at boot. Some fields hot-swap (allowed
@@ -38,6 +38,8 @@ export interface RuntimeOverrides {
   publicUrl?: string | null;
   region?: string | null;
   operatorPubkey?: string | null;
+  /** Extra console admins (hex), on top of the operator. Hot-swapped. */
+  admins?: string[];
   /**
    * Server-wide hard cap on call duration in seconds. 0 disables the cap.
    * Hot-reloaded — new rooms pick it up at `start()`, existing rooms get
@@ -87,6 +89,12 @@ export function applyOverrides(cfg: Config, o: RuntimeOverrides): void {
   if (typeof o.requireAllowedPubkey === 'boolean') cfg.requireAllowedPubkey = o.requireAllowedPubkey;
   if (typeof o.maxCallDurationSeconds === 'number' && Number.isFinite(o.maxCallDurationSeconds) && o.maxCallDurationSeconds >= 0) {
     cfg.maxCallDurationSeconds = Math.floor(o.maxCallDurationSeconds);
+  }
+  if (Array.isArray(o.admins)) {
+    cfg.adminPubkeys.clear();
+    for (const pk of o.admins) {
+      if (/^[0-9a-f]{64}$/i.test(pk)) cfg.adminPubkeys.add(pk.toLowerCase());
+    }
   }
   if (Array.isArray(o.allowed)) {
     cfg.allowedPubkeys.clear();
@@ -171,6 +179,12 @@ function urlsMatch(a: string, b: string): boolean {
 
 export function effectiveOperator(cfg: Config, sfuPubkey: string): string {
   return (cfg.operatorPubkey ?? sfuPubkey).toLowerCase();
+}
+
+/** May this pubkey use the operator console? The operator or any admin. */
+export function isConsoleAdmin(cfg: Config, sfuPubkey: string, pubkey: string): boolean {
+  const pk = pubkey.toLowerCase();
+  return pk === effectiveOperator(cfg, sfuPubkey) || cfg.adminPubkeys.has(pk);
 }
 
 /**

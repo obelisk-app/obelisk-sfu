@@ -176,7 +176,7 @@ export function Console({ session, onLogout }: { session: Session; onLogout: () 
             <div class="animate-fade-in-up" key={view}>
               {view === 'overview' && <Overview snap={snap} onTestTarget={(id) => { sessionStorage.setItem('sfu-test-target', id); go('test-peers') }} />}
               {view === 'access' && <Access snap={snap} onChange={setSnap} />}
-              {view === 'settings' && <Settings snap={snap} onChange={setSnap} />}
+              {view === 'settings' && <Settings snap={snap} me={session.pubkey} onChange={setSnap} />}
               {view === 'test-peers' && <TestPeers snap={snap} onChange={() => refresh()} />}
             </div>
           )}

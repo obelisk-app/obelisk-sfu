@@ -20,6 +20,11 @@ export interface Config {
   nsecHex: Hex;
   /** Operator pubkey (hex). Defaults to the SFU's own pubkey when unset. */
   operatorPubkey: Hex | null;
+  /**
+   * Extra pubkeys allowed into the operator console alongside the operator.
+   * Managed from the console (runtime.json `admins`) or SFU_ADMIN_PUBKEYS.
+   */
+  adminPubkeys: Set<Hex>;
   /** Pubkeys authorized to publish `start` events. Hot-swappable via SIGHUP. */
   allowedPubkeys: Set<Hex>;
   /**
@@ -236,6 +241,11 @@ export function loadConfig(): Config {
   const cfg: Config = {
     nsecHex,
     operatorPubkey: envHex('SFU_OPERATOR_PUBKEY'),
+    adminPubkeys: new Set(
+      (process.env.SFU_ADMIN_PUBKEYS ?? '').split(/[\s,]+/)
+        .map((x) => x.trim().toLowerCase())
+        .filter((x) => /^[0-9a-f]{64}$/.test(x)),
+    ),
     allowedPubkeys,
     trustedReferentPubkeys,
     followAllowedPubkeys,

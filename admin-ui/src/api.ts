@@ -49,6 +49,8 @@ export interface TestPeer {
 export interface Snapshot {
   pubkey: Hex
   operator: Hex
+  /** Extra console admins on top of the operator. */
+  admins: Hex[]
   relays: string[]
   trustedAuthorRelays: string[]
   allowed: Hex[]

@@ -8,7 +8,7 @@ import { Profile, profileName, useProfiles } from '../profiles'
 import { toast } from './toast'
 import { Avatar, CopyChip, Icon, Section, Stat, npub, shortNpub } from './ui'
 
-type ListField = 'allowed' | 'trustedReferentPubkeys'
+type ListField = 'allowed' | 'trustedReferentPubkeys' | 'admins'
 
 /** npub / nprofile / 64-hex / NIP-05 → hex pubkey. */
 export async function normalizePersonInput(raw: string): Promise<string> {
@@ -143,7 +143,7 @@ export function Access({ snap, onChange }: { snap: Snapshot; onChange: (s: Snaps
   )
 }
 
-function PeoplePanel({ title, subtitle, field, list, profiles, busy, searchable, onAdd, onRemove, footer }: {
+export function PeoplePanel({ title, subtitle, field, list, profiles, busy, searchable, onAdd, onRemove, removeConfirm, footer }: {
   title: string
   subtitle: string
   field: ListField
@@ -153,6 +153,8 @@ function PeoplePanel({ title, subtitle, field, list, profiles, busy, searchable,
   searchable?: boolean
   onAdd: (pk: string) => Promise<boolean>
   onRemove: (pk: string) => Promise<boolean>
+  /** Custom confirmation text for removing `pk`. */
+  removeConfirm?: (pk: string, name: string) => string
   footer?: preact.ComponentChildren
 }) {
   const [input, setInput] = useState('')
@@ -219,7 +221,7 @@ function PeoplePanel({ title, subtitle, field, list, profiles, busy, searchable,
               </div>
               {p?.nip05 && <CopyChip text={npub(pk)} label="copy npub" />}
               <button class="lc-pill-danger text-xs !px-3 !py-1" disabled={!!busy}
-                onClick={() => { if (confirm(`Remove ${name}?`)) onRemove(pk) }}>Remove</button>
+                onClick={() => { if (confirm(removeConfirm?.(pk, name) ?? `Remove ${name}?`)) onRemove(pk) }}>Remove</button>
             </div>
           )
         })}
