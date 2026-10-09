@@ -87,8 +87,8 @@ export class HttpServer {
         log.error('http server error', { err: (err as Error).message });
         reject(err);
       });
-      server.listen(this.deps.cfg.httpPort, () => {
-        log.info('http server listening', { port: this.deps.cfg.httpPort });
+      server.listen(this.deps.cfg.httpPort, '127.0.0.1', () => {
+        log.info('http server listening', { host: '127.0.0.1', port: this.deps.cfg.httpPort });
         resolve();
       });
       attachDirectRpc(server, {
