@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 768" width="1200" height="768" role="img" aria-labelledby="t d">
+  <title id="t">How a call connects</title>
+  <desc id="d">1. The channel's kind 30078 pin names one SFU URL. 2. The browser fetches /info. 3. It opens the /rpc WebSocket. 4. The SFU sends a challenge. 5. The browser signs kind 22242. 6. The SFU checks the operator, allow.json and trusted follows, or rejects with 4403. 7. mediasoup RPC sets up transports. 8. Media flows as DTLS-SRTP over UDP straight to the SFU. 9. The SFU publishes kind 31313 discovery and kind 31314 room status.</desc>
+  <defs><clipPath id="frame"><rect width="1200" height="768" rx="24"/></clipPath>
+  <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#ffffff" stroke-opacity="0.04"/></pattern></defs>
+  <g clip-path="url(#frame)" font-family="Inter, 'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif">
+    <rect width="1200" height="768" fill="#0a0a0a"/><rect width="1200" height="768" fill="url(#grid)"/>
+    <line x1="190" y1="104" x2="190" y2="718" stroke="#a78bfa" stroke-opacity="0.25" stroke-width="2" stroke-dasharray="4 6"/>
+<rect x="80" y="40" width="220" height="64" rx="16" fill="#121512" stroke="#a78bfa" stroke-opacity="0.6"/>
+<text x="190" y="68" text-anchor="middle" font-size="19" font-weight="800" fill="#a78bfa">Nostr relay</text>
+<text x="190" y="90" text-anchor="middle" font-size="13" fill="#9aa59a">pin · discovery · status</text><line x1="600" y1="104" x2="600" y2="718" stroke="#8fd3ff" stroke-opacity="0.25" stroke-width="2" stroke-dasharray="4 6"/>
+<rect x="490" y="40" width="220" height="64" rx="16" fill="#121512" stroke="#8fd3ff" stroke-opacity="0.6"/>
+<text x="600" y="68" text-anchor="middle" font-size="19" font-weight="800" fill="#8fd3ff">Browser</text>
+<text x="600" y="90" text-anchor="middle" font-size="13" fill="#9aa59a">your Nostr key signs</text><line x1="1010" y1="104" x2="1010" y2="718" stroke="#b4f953" stroke-opacity="0.25" stroke-width="2" stroke-dasharray="4 6"/>
+<rect x="900" y="40" width="220" height="64" rx="16" fill="#121512" stroke="#b4f953" stroke-opacity="0.6"/>
+<text x="1010" y="68" text-anchor="middle" font-size="19" font-weight="800" fill="#b4f953">Obelisk SFU</text>
+<text x="1010" y="90" text-anchor="middle" font-size="13" fill="#9aa59a">mediasoup</text>
+    <g>
+  <line x1="202" y1="150" x2="588" y2="150" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.0300;0.0550;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.0300;0.0550;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 588 150 l -12 -7 v 14 z" fill="#a78bfa"/>
+    <rect x="201" y="113" width="388" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="217" cy="126" r="11" fill="#a78bfa"/><text x="217" y="130.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">1</text>
+    <text x="235" y="131" font-size="14" font-weight="600" fill="#e8ece8">kind 30078 · the channel pins one SFU URL</text>
+  </g>
+</g><g>
+  <line x1="612" y1="212" x2="998" y2="212" stroke="#8fd3ff" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.1100;0.1350;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.1100;0.1350;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 998 212 l -12 -7 v 14 z" fill="#8fd3ff"/>
+    <rect x="607" y="175" width="396" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="623" cy="188" r="11" fill="#8fd3ff"/><text x="623" y="192.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">2</text>
+    <text x="641" y="193" font-size="14" font-weight="600" fill="#e8ece8">GET /info → SFU pubkey, operator, capacity</text>
+  </g>
+</g><g>
+  <line x1="612" y1="274" x2="998" y2="274" stroke="#8fd3ff" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.1900;0.2150;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.1900;0.2150;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 998 274 l -12 -7 v 14 z" fill="#8fd3ff"/>
+    <rect x="662" y="237" width="286" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="678" cy="250" r="11" fill="#8fd3ff"/><text x="678" y="254.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">3</text>
+    <text x="696" y="255" font-size="14" font-weight="600" fill="#e8ece8">open wss://…/rpc?channelId=…</text>
+  </g>
+</g><g>
+  <line x1="998" y1="336" x2="612" y2="336" stroke="#8fd3ff" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.2700;0.2950;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.2700;0.2950;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 612 336 l 12 -7 v 14 z" fill="#8fd3ff"/>
+    <rect x="716" y="299" width="177" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="732" cy="312" r="11" fill="#8fd3ff"/><text x="732" y="316.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">4</text>
+    <text x="750" y="317" font-size="14" font-weight="600" fill="#e8ece8">auth challenge</text>
+  </g>
+</g><g>
+  <line x1="612" y1="398" x2="998" y2="398" stroke="#8fd3ff" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.3500;0.3750;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.3500;0.3750;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 998 398 l -12 -7 v 14 z" fill="#8fd3ff"/>
+    <rect x="580" y="361" width="450" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="596" cy="374" r="11" fill="#8fd3ff"/><text x="596" y="378.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">5</text>
+    <text x="614" y="379" font-size="14" font-weight="600" fill="#e8ece8">signed kind 22242: challenge · channel · endpoint</text>
+  </g>
+</g><g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.4300;0.4550;0.8400;0.8800;1" values="0;0;1;1;0;0"/>
+  <rect x="840" y="440" width="340" height="40" rx="12" fill="#1d2a12" stroke="#b4f953" stroke-width="1.5"/>
+  <text x="1010" y="465" text-anchor="middle" font-size="14" font-weight="600" fill="#c5ff6e">operator · allow.json · trusted follows? else 4403</text>
+  <circle cx="820" cy="460" r="13" fill="#b4f953"/><text x="820" y="465" text-anchor="middle" font-size="13" font-weight="800" fill="#0a0a0a">6</text>
+</g><g>
+  <line x1="612" y1="522" x2="998" y2="522" stroke="#8fd3ff" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.5100;0.5350;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.5100;0.5350;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 998 522 l -12 -7 v 14 z" fill="#8fd3ff"/><path d="M 612 522 l 12 -7 v 14 z" fill="#8fd3ff"/>
+    <rect x="603" y="485" width="403" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="619" cy="498" r="11" fill="#8fd3ff"/><text x="619" y="502.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">7</text>
+    <text x="637" y="503" font-size="14" font-weight="600" fill="#e8ece8">mediasoup RPC: transports, produce, consume</text>
+  </g>
+</g><g>
+  <line x1="612" y1="584" x2="998" y2="584" stroke="#c5ff6e" stroke-width="6" stroke-linecap="round" stroke-dasharray="386 386" stroke-dashoffset="386"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.5900;0.6150;1" values="386;386;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.5900;0.6150;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 998 584 l -12 -7 v 14 z" fill="#c5ff6e"/><path d="M 612 584 l 12 -7 v 14 z" fill="#c5ff6e"/><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.0s" repeatCount="indefinite" path="M 626 584 L 984 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.15s" repeatCount="indefinite" path="M 984 584 L 626 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.3s" repeatCount="indefinite" path="M 626 584 L 984 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.44999999999999996s" repeatCount="indefinite" path="M 984 584 L 626 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.6s" repeatCount="indefinite" path="M 626 584 L 984 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.75s" repeatCount="indefinite" path="M 984 584 L 626 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="0.8999999999999999s" repeatCount="indefinite" path="M 626 584 L 984 584"/></circle><circle r="4" fill="#0a0a0a"><animateMotion dur="1.2s" begin="1.0499999999999998s" repeatCount="indefinite" path="M 984 584 L 626 584"/></circle>
+    <rect x="603" y="547" width="403" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="619" cy="560" r="11" fill="#c5ff6e"/><text x="619" y="564.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">8</text>
+    <text x="637" y="565" font-size="14" font-weight="600" fill="#e8ece8">audio · camera · screen: DTLS-SRTP over UDP</text>
+  </g>
+</g><g>
+  <line x1="998" y1="646" x2="202" y2="646" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="796 796" stroke-dashoffset="796"><animate attributeName="stroke-dashoffset" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.6700;0.6950;1" values="796;796;0;0"/><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.8400;0.8800;1" values="1;1;0;1"/></line>
+  <g opacity="0"><animate attributeName="opacity" dur="20.0s" repeatCount="indefinite" keyTimes="0;0.6700;0.6950;0.8400;0.8800;1" values="0;0;1;1;0;0"/><path d="M 202 646 l 12 -7 v 14 z" fill="#a78bfa"/>
+    <rect x="363" y="609" width="474" height="26" rx="13" fill="#0a0a0a"/>
+    <circle cx="379" cy="622" r="11" fill="#a78bfa"/><text x="379" y="626.5" text-anchor="middle" font-size="12" font-weight="800" fill="#0a0a0a">9</text>
+    <text x="397" y="627" font-size="14" font-weight="600" fill="#e8ece8">kind 31313 discovery · kind 31314 active-room status</text>
+  </g>
+</g>
+    <text x="600" y="748" text-anchor="middle" font-size="13" fill="#7d877d">Media never passes through a Nostr relay or the HTTPS tunnel. Older clients still use the kind 25052 / 25050 path.</text>
+  </g>
+</svg>
